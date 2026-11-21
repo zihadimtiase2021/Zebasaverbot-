@@ -33,6 +33,8 @@ log = logging.getLogger("zeba.webhook")
 MAX_BODY = 64 * 1024
 MAX_URLS = 50
 MAX_CAPTION = 1000
+MAX_CONNS = 256          # simultaneous connections; extra ones are dropped (file-descriptor / slowloris guard)
+MAX_TRACKED_IPS = 4096   # bound on the failed-login table (it is keyed by client address)
 REASONS = {200: "OK", 202: "Accepted", 204: "No Content", 303: "See Other", 400: "Bad Request", 401: "Unauthorized", 404: "Not Found",
            405: "Method Not Allowed", 408: "Request Timeout", 411: "Length Required", 413: "Payload Too Large",
            429: "Too Many Requests", 500: "Internal Server Error", 503: "Service Unavailable"}
@@ -59,6 +61,7 @@ class WebhookServer:
         self._hits: dict[str, deque] = defaultdict(deque)
         self._fails: dict[str, deque] = defaultdict(deque)
         self._server: asyncio.AbstractServer | None = None
+        self._conns = 0
 
     # ---------------------------------------------------------------- lifecycle
     async def start(self, host: str, port: int) -> int:
@@ -76,8 +79,27 @@ class WebhookServer:
                 pass
 
     # ---------------------------------------------------------------- http plumbing
+    @staticmethod
+    def _close(writer) -> None:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
     async def _on_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if self._conns >= MAX_CONNS:
+            self._close(writer)
+            return
+        self._conns += 1
+        try:
+            await self._serve(reader, writer)
+        finally:
+            self._conns -= 1
+            self._close(writer)  # also covers the early returns below and the /admin branch
+
+    async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         headers_out: dict[str, str] = {}
+        method = ""
         try:
             try:
                 method, path, headers, body, ip = await asyncio.wait_for(self._read(reader, writer), 15)
@@ -105,8 +127,11 @@ class WebhookServer:
         try:
             data = b"" if status == 204 else json.dumps(payload, ensure_ascii=False).encode()
             head = [f"HTTP/1.1 {status} {REASONS.get(status, 'OK')}", "Content-Type: application/json; charset=utf-8",
-                    f"Content-Length: {len(data)}", "Connection: close", "Cache-Control: no-store"]
+                    f"Content-Length: {len(data)}", "Connection: close", "Cache-Control: no-store",
+                    "X-Content-Type-Options: nosniff"]
             head += [f"{k}: {v}" for k, v in headers_out.items()]
+            if method == "HEAD":
+                data = b""  # a HEAD response carries the headers (incl. Content-Length) but never a body
             writer.write(("\r\n".join(head) + "\r\n\r\n").encode() + data)
             await asyncio.wait_for(writer.drain(), 10)
         except Exception:
@@ -134,31 +159,51 @@ class WebhookServer:
         for line in lines[1:]:
             if ":" in line:
                 k, v = line.split(":", 1)
-                headers[k.strip().lower()] = v.strip()
+                k, v = k.strip().lower(), v.strip()
+                if k == "content-length" and headers.get(k, v) != v:
+                    raise _HttpError(400, "conflicting Content-Length headers")
+                headers[k] = v
         if "chunked" in headers.get("transfer-encoding", "").lower():
             raise _HttpError(411, "send a Content-Length (chunked bodies are not supported)")
-        try:
-            length = int(headers.get("content-length", "0") or 0)
-        except ValueError:
+        raw_len = headers.get("content-length", "0") or "0"
+        if not (raw_len.isascii() and raw_len.isdigit()):  # int() would also accept "+5", "1_0", "-0" and non-ASCII digits
             raise _HttpError(400, "bad Content-Length")
-        if length < 0 or length > MAX_BODY:
+        length = int(raw_len)
+        if length > MAX_BODY:
             raise _HttpError(413, f"body larger than {MAX_BODY} bytes")
         body = await reader.readexactly(length) if length else b""
         peer = writer.get_extra_info("peername") or ("?",)
-        fwd = headers.get("x-forwarded-for", "").split(",")[0].strip()
+        # The LAST entry is the one our own proxy appended; the first is client-supplied and can be spoofed to dodge
+        # the failed-login limiter or to fill its table with fake addresses.
+        fwd = headers.get("x-forwarded-for", "").split(",")[-1].strip()
         return method.upper(), target.split("?", 1)[0], headers, body, fwd or str(peer[0])
 
     # ---------------------------------------------------------------- routing
     def _limited(self, store: dict[str, deque], key: str, limit: int, record: bool = True) -> bool:
         now = time.monotonic()
-        dq = store[key]
+        dq = store.get(key)
+        if dq is None:
+            if not record:
+                return False
+            dq = store[key] = deque()
         while dq and now - dq[0] > 60:
             dq.popleft()
         if len(dq) >= limit:
             return True
         if record:
             dq.append(now)
+        elif not dq:
+            store.pop(key, None)
         return False
+
+    def _note_fail(self, ip: str) -> None:
+        now = time.monotonic()
+        if ip not in self._fails and len(self._fails) >= MAX_TRACKED_IPS:
+            for k in [k for k, d in self._fails.items() if not d or now - d[-1] > 60]:
+                del self._fails[k]
+            while len(self._fails) >= MAX_TRACKED_IPS:  # still full: forget the oldest address
+                del self._fails[next(iter(self._fails))]
+        self._fails[ip].append(now)
 
     def _authorized(self, headers: dict, body: bytes) -> bool:
         if not self.secret:
@@ -187,7 +232,7 @@ class WebhookServer:
         if self._limited(self._fails, ip, 10, record=False):
             raise _HttpError(429, "too many failed attempts")
         if not self._authorized(headers, body):
-            self._fails[ip].append(time.monotonic())  # 10 failures/min from one address -> blocked
+            self._note_fail(ip)  # 10 failures/min from one address -> blocked
             raise _HttpError(401, "invalid or missing secret")
         if self._limited(self._hits, "all", self.rate):
             raise _HttpError(429, "rate limit exceeded")
@@ -211,9 +256,8 @@ class WebhookServer:
             try:
                 data = json.loads(text) if text else {}
             except ValueError:
-                data = {"urls": [text]}  # plain text: links are extracted below
+                data = {"urls": extract_urls(text) or [text]}  # plain text: every link in it is queued
         raw: list[tuple[str, str | None]] = []
-        force = False
         if isinstance(data, str):
             data = {"urls": [data]}
         if isinstance(data, list):
@@ -222,23 +266,32 @@ class WebhookServer:
             raise _HttpError(400, "send a JSON object like {\"url\": \"https://...\"}")
         force = str(data.get("force", "")).lower() in ("1", "true", "yes")
         top_caption = data.get("caption") if isinstance(data.get("caption"), str) else None
+        plain: list[str] = []
         if isinstance(data.get("url"), str):
-            raw.append((data["url"], top_caption))
+            plain.append(data["url"])
         urls = data.get("urls")
         if isinstance(urls, str):
             urls = [urls]
         if isinstance(urls, list):
-            if top_caption and len(urls) > 1:
-                raise _HttpError(400, "a caption with several links is ambiguous - use \"items\": [{\"url\":..., \"caption\":...}]")
-            raw += [(u, top_caption if len(urls) == 1 else None) for u in urls if isinstance(u, str)]
-        for it in data.get("items") or []:
+            plain += [u for u in urls if isinstance(u, str)]
+        if top_caption and len(plain) > 1:
+            raise _HttpError(400, "a caption with several links is ambiguous - use \"items\": [{\"url\":..., \"caption\":...}]")
+        raw += [(u, top_caption if len(plain) == 1 else None) for u in plain]
+        items = data.get("items")
+        if isinstance(items, (str, dict)):  # a bare string/object used to be iterated character by character / key by key
+            items = [items]
+        if not isinstance(items, list):
+            items = []
+        for it in items:
             if isinstance(it, str):
                 raw.append((it, None))
             elif isinstance(it, dict) and isinstance(it.get("url"), str):
                 cap = it.get("caption") if isinstance(it.get("caption"), str) else None
                 raw.append((it["url"], cap))
+        if len(raw) > MAX_URLS:  # never drop links silently
+            raise _HttpError(400, f"too many links (max {MAX_URLS} per request)")
         out, invalid = [], []
-        for u, cap in raw[:MAX_URLS]:
+        for u, cap in raw:
             found = extract_urls(u, 1)
             if found:
                 out.append((found[0], (cap or "").strip()[:MAX_CAPTION] or None))
@@ -254,8 +307,20 @@ class WebhookServer:
             raise _HttpError(400, f"none of the links is supported: {invalid}")
         if self.queue.snapshot()["pending"] + len(items) > self.max_queue:
             raise _HttpError(503, "queue is full, try again later")
-        queued, duplicates = [], []
+        queued, duplicates, errors = [], [], []
         for url, caption in items:
-            (queued if self.queue.enqueue(self._job(url=url, force=force, custom_caption=caption)) else duplicates).append(url)
-        log.info("webhook: queued %d link(s), %d duplicate(s), %d invalid", len(queued), len(duplicates), len(invalid))
-        return 202, {"ok": True, "queued": len(queued), "urls": queued, "duplicates": duplicates, "invalid": invalid}
+            try:
+                added = self.queue.enqueue(self._job(url=url, force=force, custom_caption=caption))
+            except Exception:
+                log.exception("webhook: could not queue %s", url)
+                errors.append(url)
+                continue
+            (queued if added else duplicates).append(url)
+        if errors and not queued and not duplicates:
+            raise _HttpError(500, "could not queue the links")
+        log.info("webhook: queued %d link(s), %d duplicate(s), %d invalid, %d error(s)",
+                 len(queued), len(duplicates), len(invalid), len(errors))
+        resp = {"ok": True, "queued": len(queued), "urls": queued, "duplicates": duplicates, "invalid": invalid}
+        if errors:
+            resp["errors"] = errors
+        return 202, resp

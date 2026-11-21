@@ -12,8 +12,9 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import time
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 from unified_core.webui import SPIN, alert, e, layout, pw_field
 from unified_services.runtime_config import NUMBERS, STRINGS, TOGGLES, RuntimeConfig
@@ -21,6 +22,8 @@ from unified_services.runtime_config import NUMBERS, STRINGS, TOGGLES, RuntimeCo
 log = logging.getLogger("zeba.admin")
 
 COOKIE = "zeba_admin"
+SESSION_TTL = 12 * 3600   # server-enforced: a copied cookie stops working after this, not only in the browser
+_INT = re.compile(r"-?[0-9]{1,9}")
 CSP = ("default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; "
        "connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
 
@@ -59,8 +62,13 @@ class AdminPanel:
         self._acc_login = WebAccountLogin(self)
 
     # ------------------------------------------------------------------ plumbing
+    def _sign(self, exp: str) -> str:
+        return hmac.new(self.secret.encode(), f"zeba-admin-panel-v2:{exp}".encode(), hashlib.sha256).hexdigest()
+
     def _token(self) -> str:
-        return hmac.new(self.secret.encode(), b"zeba-admin-panel-v1", hashlib.sha256).hexdigest()
+        """`<expiry-unix-time>.<hmac>` - the expiry is signed, so it cannot be extended by the client."""
+        exp = str(int(time.time()) + SESSION_TTL)
+        return f"{exp}.{self._sign(exp)}"
 
     def _authed(self, headers: dict) -> bool:
         cookies = {}
@@ -68,7 +76,30 @@ class AdminPanel:
             if "=" in part:
                 k, v = part.strip().split("=", 1)
                 cookies[k] = v
-        return hmac.compare_digest(cookies.get(COOKIE, "").encode(), self._token().encode())
+        exp, _, sig = cookies.get(COOKIE, "").partition(".")
+        if not (exp.isascii() and exp.isdigit() and 0 < len(exp) <= 12 and sig):
+            return False
+        if int(exp) < time.time():
+            return False
+        return hmac.compare_digest(sig.encode(), self._sign(exp).encode())
+
+    @staticmethod
+    def _cookie(value: str, max_age: int, headers: dict) -> str:
+        # `Secure` cookies are dropped by some browsers on plain http (local runs); keep it everywhere else.
+        host = headers.get("host", "").lower()
+        plain = (headers.get("x-forwarded-proto", "").split(",")[0].strip().lower() == "http"
+                 or host.startswith(("localhost", "127.0.0.1", "[::1]")))
+        return f"{COOKIE}={value}; Path=/admin; Max-Age={max_age}; HttpOnly; SameSite=Strict" + ("" if plain else "; Secure")
+
+    @staticmethod
+    def _same_origin(headers: dict) -> bool:
+        """CSRF defence on top of SameSite=Strict: a POST carrying an Origin of another site is refused.
+        A missing or 'null' Origin is allowed (some browsers send 'null' under Referrer-Policy: no-referrer)."""
+        origin = headers.get("origin", "")
+        if not origin or origin == "null":
+            return True
+        host = (headers.get("x-forwarded-host") or headers.get("host") or "").split(",")[0].strip().lower()
+        return not host or urlsplit(origin).netloc.lower() == host
 
     @staticmethod
     def _html(body: str, status: int = 200, extra: dict | None = None):
@@ -81,7 +112,8 @@ class AdminPanel:
     @staticmethod
     def _json(obj: dict, status: int = 200):
         data = json.dumps(obj, ensure_ascii=False).encode()
-        return status, {"Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store"}, data
+        return status, {"Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store",
+                        "X-Content-Type-Options": "nosniff"}, data
 
     def _redirect(self, to: str, extra: dict | None = None):
         return 303, {"Location": to, "Cache-Control": "no-store", **(extra or {})}, b""
@@ -94,29 +126,36 @@ class AdminPanel:
     # ------------------------------------------------------------------ entry point
     async def handle(self, method: str, path: str, headers: dict, body: bytes, ip: str):
         try:
-            return await self._handle(method, path.rstrip("/") or "/", headers, body)
+            return await self._handle(method, path.rstrip("/") or "/", headers, body, ip)
         except Exception:
             log.exception("admin panel error")
             return self._json({"ok": False, "error": "internal error"}, 500)
 
-    async def _handle(self, method: str, path: str, headers: dict, body: bytes):
+    async def _handle(self, method: str, path: str, headers: dict, body: bytes, ip: str = "?"):
         if not self.secret:
             return self._json({"ok": False, "error": "admin panel is disabled (set WEBHOOK_SECRET)"}, 404)
         form = {k: v[0] for k, v in parse_qs(body.decode("utf-8", "ignore"), keep_blank_values=True).items()}
 
+        if method == "POST" and not self._same_origin(headers):
+            return self._json({"ok": False, "error": "cross-site request refused"}, 403)
+
         if path == "/admin/unlock" and method == "POST":
             if self._locked_out():
                 return self._html(self._unlock_page("Too many attempts. Wait a minute."), 429)
-            if not hmac.compare_digest(form.get("pw", "").encode(), self.secret.encode()):
+            # strip: a password pasted from a phone/notes app often carries a trailing space or newline
+            if not hmac.compare_digest(form.get("pw", "").strip().encode(), self.secret.encode()):
                 self._fails.append(time.time())
+                log.warning("admin panel: wrong password from %s", ip)
                 await asyncio.sleep(1.5)
                 return self._html(self._unlock_page("Wrong password."), 401)
-            return self._redirect("/admin", {"Set-Cookie": f"{COOKIE}={self._token()}; Path=/admin; Max-Age=43200; HttpOnly; Secure; SameSite=Strict"})
+            return self._redirect("/admin", {"Set-Cookie": self._cookie(self._token(), SESSION_TTL, headers)})
 
         if not self._authed(headers):
             if method == "POST":
                 return self._json({"ok": False, "error": "Locked. Reload the page and unlock again."}, 401)
             return self._html(self._unlock_page())
+        if path == "/admin/unlock":  # already unlocked (back button / bookmark)
+            return self._redirect("/admin")
 
         if path == "/admin/accounts" or path.startswith("/admin/accounts/"):
             kind, html = await self._acc_login.handle(method, path, form)
@@ -134,42 +173,76 @@ class AdminPanel:
             return self._html(await admin_settings.relogin())
         if path == "/admin/wmpreview" and method == "GET":
             from unified_services.watermark import sample_preview
-            data = await asyncio.to_thread(sample_preview, self.rt.cfg)
-            return 200, {"Content-Type": "image/jpeg", "Cache-Control": "no-store"}, data
+            try:
+                data = await asyncio.to_thread(sample_preview, self.rt.cfg)
+            except Exception as exc:
+                log.warning("watermark preview failed: %s", exc)
+                return self._json({"ok": False, "error": "preview unavailable"}, 503)
+            return 200, {"Content-Type": "image/jpeg", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}, data
         if method != "POST":
             return self._json({"ok": False, "error": "not found"}, 404)
 
         if path == "/admin/logout":
-            return self._redirect("/admin", {"Set-Cookie": f"{COOKIE}=; Path=/admin; Max-Age=0; HttpOnly; Secure; SameSite=Strict"})
+            return self._redirect("/admin", {"Set-Cookie": self._cookie("", 0, headers)})
+        try:
+            return await self._mutate(path, form)
+        except ValueError as exc:
+            return self._json({"ok": False, "error": str(exc)}, 400)
+        except Exception as exc:  # Telegram refused / flood-wait while saving: say so instead of a blind "internal error"
+            log.exception("admin panel: %s failed", path)
+            return self._json({"ok": False, "error": f"could not save ({type(exc).__name__}) - try again in a moment"}, 502)
+
+    async def _mutate(self, path: str, form: dict):
+        cfg, saved = self.rt.cfg, self.rt.saved
         if path == "/admin/toggle":
             key = form.get("key", "")
             if key not in TOGGLES:
                 return self._json({"ok": False, "error": "unknown setting"}, 400)
-            await self.rt.set_toggle(key, form.get("value") == "1")
+            old, had, old_saved = getattr(cfg, key), key in saved, saved.get(key)
+            try:
+                await self.rt.set_toggle(key, form.get("value") == "1")
+            except Exception:
+                self._rollback(key, old, had, old_saved)  # runtime must match what the switch shows after a failed save
+                raise
             return self._json({"ok": True})
         if path == "/admin/number":
             key = form.get("key", "")
             raw = (form.get("value") or "").strip()
-            if key not in NUMBERS or not raw.lstrip("-").isdigit():
+            # str.isdigit() accepts "\u00b2" and lstrip("-") accepts "--5": both then crashed int() -> HTTP 500
+            if key not in NUMBERS or not _INT.fullmatch(raw):
                 return self._json({"ok": False, "error": "enter a whole number"}, 400)
-            return self._json({"ok": True, "value": await self.rt.set_number(key, int(raw))})
+            old, had, old_saved = getattr(cfg, key), key in saved, saved.get(key)
+            try:
+                value = await self.rt.set_number(key, int(raw))
+            except Exception:
+                self._rollback(key, old, had, old_saved)
+                raise
+            return self._json({"ok": True, "value": value})
         if path == "/admin/wm":
             vals = {k: form.get(k, "") for k in STRINGS if k in form}
+            olds = {k: (getattr(cfg, k, None), k in saved, saved.get(k)) for k in vals}
             try:
                 await self.rt.set_many(vals)
-            except ValueError as exc:
-                return self._json({"ok": False, "error": str(exc)}, 400)
+            except Exception:
+                for k, (o, h, os_) in olds.items():
+                    self._rollback(k, o, h, os_)
+                raise
             return self._json({"ok": True})
         if path == "/admin/target":
             chan = (form.get("channel_manual") or "").strip() or (form.get("channel_pick") or "").strip()
             if not chan:
                 return self._json({"ok": False, "error": "Choose a channel or enter its id / @username."}, 400)
-            try:
-                title = await self.rt.set_target(chan)
-            except ValueError as exc:
-                return self._json({"ok": False, "error": str(exc)}, 400)
+            title = await self.rt.set_target(chan)
             return self._json({"ok": True, "title": title, "id": self.rt.target_info()["id"]})
         return self._json({"ok": False, "error": "not found"}, 404)
+
+    def _rollback(self, key: str, old, had: bool, old_saved) -> None:
+        if old is not None:
+            setattr(self.rt.cfg, key, old)
+        if had:
+            self.rt.saved[key] = old_saved
+        else:
+            self.rt.saved.pop(key, None)
 
     # ------------------------------------------------------------------ pages
     def _unlock_page(self, msg: str = "") -> str:
@@ -203,7 +276,12 @@ class AdminPanel:
                         for k, (l, lo, hi) in NUMBERS.items() if not k.startswith("WM_"))
         st = snap["strings"]
         from unified_services.watermark import POSITIONS, list_fonts
-        fonts = "".join(f'<option value="{e(f)}">' for f in list_fonts(getattr(self.rt.cfg, "DATA_DIR", None))[:200])
+        try:
+            font_names = list(list_fonts(getattr(self.rt.cfg, "DATA_DIR", None)))[:200]
+        except Exception as exc:
+            log.warning("could not list fonts: %s", exc)
+            font_names = []
+        fonts = "".join(f'<option value="{e(f)}">' for f in font_names)
         pos = "".join(f'<option value="{k}"{" selected" if st["WM_POSITION"] == k else ""}>{e(v)}</option>' for k, v in POSITIONS.items())
         nobg = st["WM_BG_COLOR"] == "none"
         wm_rows = "".join(trow(k, l, d) for k, (l, d) in TOGGLES.items() if k.startswith("WM_")) + "".join(
