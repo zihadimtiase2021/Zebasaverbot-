@@ -14,6 +14,7 @@ from unified_core.cleanup import safe_rmtree
 from unified_core.config import settings
 from unified_core.database import db
 from unified_core.utils import NOTIFY_MARK, esc, extract_urls, items_from_file, short_error, split_url_and_caption
+from unified_services import ui
 from unified_services.context import App
 from unified_services.pipeline import BatchTracker, Job, JobResult
 
@@ -24,28 +25,31 @@ MAX_URLS_PER_MESSAGE = 10
 
 def _render_dashboard(app: App, tracker: BatchTracker, final: bool = False) -> str:
     total, done = tracker.total, tracker.done
-    pct = min(100.0, done / total * 100) if total else 100
-    filled = min(15, int(15 * done // total)) if total else 15
-    bar = "█" * filled + "░" * (15 - filled)
     active = [j for j in app.queue.active.values() if j.batch is tracker]
     pending = max(0, total - done - len(active))
+    if not final:
+        title = ui.head("⚡", "Batch running")
+    elif tracker.failed:
+        title = ui.head("⚠️", "Batch finished", "with errors")
+    else:
+        title = ui.head("✅", "Batch finished")
 
     lines = [
-        NOTIFY_MARK + "✨ <b>ZEBA BATCH PROCESSOR</b> ✨",
+        NOTIFY_MARK + title,
         "",
-        f"📊 <b>Progress:</b> <code>{done} / {total}</code> ({pct:.1f}%)",
-        f"<code>[{bar}]</code>",
-        f"✅ {tracker.ok}   ⏭ {tracker.skipped}   ❌ {tracker.failed}",
+        f"<code>{ui.bar(done, total)}</code> {ui.percent(done, total):.0f}%",
+        f"📊 <b>{done} / {total}</b>  ·  ✅ {tracker.ok}  ·  ⏭ {tracker.skipped}  ·  ❌ {tracker.failed}",
     ]
     if not final:
-        lines += ["", f"⚡ <b>Active:</b> {len(active)}/{settings.MAX_CONCURRENCY}   ⏳ <b>Queued:</b> {pending}", ""]
+        lines += ["", f"⚙️ <b>Active:</b> {len(active)}/{settings.MAX_CONCURRENCY}  ·  ⏳ <b>Queued:</b> {pending}"]
         for j in active[:8]:
             name = j.url.rstrip("/").split("/")[-1].split("?")[0][:25] or "link"
             lines.append(f"▪️ <code>{esc(name)}</code> — <i>{esc(j.step)}</i>")
     else:
-        lines += ["", "🎉 <b>Batch finished.</b>"]
         budget = 3500 - sum(len(x) + 1 for x in lines)  # Telegram's limit is 4096 chars: escaping can inflate text
         shown = 0
+        if tracker.failures:
+            lines.append("")
         for url, err in tracker.failures[:10]:
             row = f"❌ <code>{esc(url[:60])}</code>\n   ↳ {esc((err or '')[:120])}"
             if len(row) + 1 > budget:
@@ -78,18 +82,19 @@ async def x_command(event, cmd: str) -> str:
     if name == ".xacc":
         accounts = await x_accounts.account_status(db_path)
         if not accounts:
-            return ("🐦 <b>No X accounts yet.</b>\nAdd one: <code>.xadd username auth_token ct0</code>\n"
-                    "(the message is deleted right away)")
+            return (ui.head("🐦", "No X accounts yet") + "\nAdd one: <code>.xadd username auth_token ct0</code>\n"
+                    + ui.hint("The message is deleted right away."))
         ready = sum(1 for a in accounts if a["active"] and not a["locked_until"])
-        return f"🐦 <b>X accounts</b> ({ready}/{len(accounts)} ready)\n" + "\n".join(_fmt_status(a) for a in accounts)
+        return (ui.head("🐦", f"X accounts ({ready}/{len(accounts)} ready)") + "\n"
+                + "\n".join(_fmt_status(a) for a in accounts))
     if name == ".xunlock":
         await x_accounts.unlock_all(db_path)
-        return "🔓 <b>Rate-limit locks cleared.</b>"
+        return ui.ok("<b>Rate-limit locks cleared.</b>")
     if name == ".xdel":
         if len(parts) != 2:
-            return "ℹ️ Usage: <code>.xdel username</code>"
+            return ui.usage(".xdel username")
         ok = await x_accounts.remove_account(db_path, parts[1].lstrip("@"))
-        return "🗑 <b>Removed.</b>" if ok else "❌ <b>No such account.</b>"
+        return ui.ok("<b>Removed.</b>") if ok else ui.fail("No such account")
     # .xadd - the message holds secrets: delete it before doing anything else
     try:
         await event.delete()
@@ -97,11 +102,11 @@ async def x_command(event, cmd: str) -> str:
         pass
     if len(parts) != 4 or not _X_USER.fullmatch(parts[1].lstrip("@")) \
             or not _X_SECRET.fullmatch(parts[2]) or not _X_SECRET.fullmatch(parts[3]):
-        return "ℹ️ Usage: <code>.xadd username auth_token ct0</code>"
+        return ui.usage(".xadd username auth_token ct0")
     settings.ensure_dirs()
     accounts = await x_accounts.add_account(
         db_path, parts[1].lstrip("@"), x_accounts.cookie_header(parts[2], parts[3]))
-    return ("✅ <b>X account saved.</b> Accounts: "
+    return (ui.ok("<b>X account saved.</b>") + " Accounts: "
             + ", ".join(f"@{esc(n)}" for n, _ in accounts))
 
 
@@ -221,7 +226,7 @@ async def run_batch(app: App, event, items: list[tuple[str, str | None]], force:
     batch_id = await db.batch_create(event.chat_id, force, items, dest, owner=getattr(app, "me_id", None))  # stored first: survives a restart
     state = {"chat_id": event.chat_id, "msg_id": None, "batch_id": batch_id}
     try:
-        msg = await event.respond(NOTIFY_MARK + "🔄 <b>Initializing batch…</b>", parse_mode="html")
+        msg = await event.respond(NOTIFY_MARK + ui.head("⏳", "Starting batch…"), parse_mode="html")
         state["msg_id"] = msg.id
         await db.batch_set_message(batch_id, msg.id)
     except Exception as exc:  # the dashboard loop posts the message itself later; the batch must still run
@@ -262,7 +267,7 @@ async def _resume_one(app: App, b: dict) -> int:
     log.warning("Resuming batch %s: %d of %d links left", b["id"], len(todo), len(items))
     try:
         await app.pipeline.notify(
-            f"♻️ <b>Resuming batch after restart</b>\n"
+            ui.head("♻️", "Resuming batch after restart") + "\n"
             f"Already finished: {tracker.done} / {tracker.total} · remaining: {len(todo)}"
         )
     except Exception as exc:  # a failed notice must not stop the batch from resuming
@@ -373,14 +378,14 @@ def register_userbot_handlers(app: App) -> None:
                     return await reply(event, "🤖 " + esc(await tr.set_mode(arg)))
                 return await reply(event, "🤖 <b>Translation</b>\n" + esc(await tr.describe()))
             except Exception as exc:
-                return await reply(event, f"❌ <b>Failed:</b> {esc(short_error(exc))}")
+                return await reply(event, ui.fail("Failed", short_error(exc)))
         if head in (".settings", ".target", ".source", ".comments") and app.runtime is not None:
             from unified_services.runtime_config import handle_command
 
             try:
                 answer = await handle_command(app.runtime, cmd)
             except Exception as exc:
-                answer = f"❌ <b>Failed:</b> {esc(short_error(exc))}"
+                answer = ui.fail("Failed", short_error(exc))
             return await reply(event, answer)
         if head == ".wm" and app.runtime is not None:
             from unified_services import wm_handlers
@@ -392,7 +397,7 @@ def register_userbot_handlers(app: App) -> None:
                     await wm_handlers.send_preview(userbot, chat_id)
                     answer = "\U0001f4a7 Preview sent."
             except Exception as exc:
-                answer = f"❌ <b>Failed:</b> {esc(short_error(exc))}"
+                answer = ui.fail("Failed", short_error(exc))
             return await reply(event, answer)
         if cmd == ".wmfont" or cmd.startswith(".wmfont "):
             from unified_services import wm_handlers
@@ -406,8 +411,8 @@ def register_userbot_handlers(app: App) -> None:
             s = app.queue.snapshot()
             return await reply(
                 event,
-                f"📊 <b>Zeba</b>\nQueue: {s['pending']} · Active: {s['active']}\n"
-                f"Done: {s['ok']} · Skipped: {s['skipped']} · Failed: {s['failed']}",
+                ui.head("📊", "Zeba status") + f"\n⏳ Queue: {s['pending']} · ⚙️ Active: {s['active']}\n"
+                f"✅ Done: {s['ok']} · ⏭ Skipped: {s['skipped']} · ❌ Failed: {s['failed']}",
             )
 
         # ---- message forwarding: .fwdsrc / .fwddst / .fwd ... (copy chat -> chat, download + upload) ----
@@ -415,7 +420,7 @@ def register_userbot_handlers(app: App) -> None:
             try:
                 answer = await app.forwarder.handle_command(event, cmd)
             except Exception as exc:
-                answer = f"❌ <b>Failed:</b> {esc(short_error(exc))}"
+                answer = ui.fail("Failed", short_error(exc))
             await reply(event, answer)
             if head in (".fwdsrc", ".fwddst") and chat_id != app.me_id:
                 app.forwarder.delete_later(chat_id, event.id)  # typed inside a real chat: clean up after 20 s
@@ -426,7 +431,7 @@ def register_userbot_handlers(app: App) -> None:
             try:
                 answer = await x_command(event, cmd)
             except Exception as exc:
-                answer = f"❌ <b>Failed:</b> {esc(short_error(exc))}"
+                answer = ui.fail("Failed", short_error(exc))
             if head == ".xadd":  # original message is already deleted
                 await event.respond(NOTIFY_MARK + answer, parse_mode="html")
                 return
@@ -458,11 +463,11 @@ def register_userbot_handlers(app: App) -> None:
                         items = await asyncio.to_thread(items_from_file, Path(path))  # up to 20 MB: keep the loop free
                 except Exception as exc:
                     log.warning("batch file unreadable: %s", exc)
-                    return await reply(event, f"❌ <b>Could not read the file:</b> {esc(short_error(exc))}")
+                    return await reply(event, ui.fail("Could not read the file", short_error(exc)))
                 finally:
                     safe_rmtree(tmp)
                 if not items:
-                    return await reply(event, "❌ <b>No supported URLs found in the file.</b>")
+                    return await reply(event, ui.fail("No supported URLs found in the file"))
                 dest = chat_id if await db.is_dlauto_chat(chat_id) else None
                 _spawn(run_batch(app, event, items, force=bool(re.match(r"\.batch\s+-f(\s|$)", text)), dest=dest))
             return
@@ -475,7 +480,7 @@ def register_userbot_handlers(app: App) -> None:
                 force, rest = True, rest[2:].strip()
             urls, caption = split_url_and_caption(rest, MAX_URLS_PER_MESSAGE)
             if not urls:
-                return await reply(event, "ℹ️ Usage: <code>.dl [-f] &lt;url&gt; [your caption]</code>")
+                return await reply(event, ui.usage(".dl [-f] <url> [your caption]"))
         elif await auto_enabled(chat_id):
             urls = extract_urls(text, MAX_URLS_PER_MESSAGE)
         else:
@@ -517,6 +522,7 @@ async def on_job_result(app: App, job: Job, result: JobResult) -> None:
         await app.pipeline.notify(f"✅ <b>Posted</b>{extra}{link}\n<code>{u}</code>")
     elif result.status == "skipped":
         link = f"\n{esc(result.link)}" if result.link else ""
-        await app.pipeline.notify(f"⏭ <b>Already posted</b> (use <code>.dl -f</code> to force){link}\n<code>{u}</code>")
+        await app.pipeline.notify(f"⏭ <b>Already posted</b>{link}\n<code>{u}</code>\n"
+                                  + ui.hint("Use <code>.dl -f</code> to post it again."))
     else:
-        await app.pipeline.notify(f"❌ <b>Failed</b>: {esc(result.error)}\n<code>{u}</code>")
+        await app.pipeline.notify(ui.fail("Failed", result.error or "unknown error") + f"\n<code>{u}</code>")

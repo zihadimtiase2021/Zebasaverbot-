@@ -30,6 +30,7 @@ from unified_core.cleanup import safe_rmtree
 from unified_core.config import settings
 from unified_core.database import NOTE_MAX, db
 from unified_core.utils import short_error
+from unified_services import ui
 from unified_services.forwarder import TEXT_LIMIT, build_html, msg_link
 
 log = logging.getLogger("zeba.edit")
@@ -221,7 +222,7 @@ def register_edit_commands(bot, is_admin, app, h) -> ProductEditor:
     stop = getattr(events, "StopPropagation", None)
 
     def back_cancel(uid: str) -> list:
-        return [[B("🔙 Back", f"fe:{uid}:p".encode()), B("❌ Cancel", f"fe:{uid}:x".encode())]]
+        return [[B(ui.L_BACK, f"fe:{uid}:p".encode()), B(ui.L_CANCEL, f"fe:{uid}:x".encode())]]
 
     def panel(row: dict):
         uid = row["uid"]
@@ -230,7 +231,7 @@ def register_edit_commands(bot, is_admin, app, h) -> ProductEditor:
         if row.get("media") != 0:
             first.insert(0, B("🖼 File", f"fe:{uid}:m".encode()))
         rows.append(first)
-        rows.append([B("🔒 Details", f"fe:{uid}:d".encode()), B("✖ Close", f"fe:{uid}:x".encode())])
+        rows.append([B("🔒 Details", f"fe:{uid}:d".encode()), B(ui.L_CLOSE, f"fe:{uid}:x".encode())])
         text = (f"✏️ <b>Edit {esc(uid)}</b>\n"
                 "🖼 file and 📝 caption change the <b>live message in the channel</b> and the record; "
                 "🔒 details are private (record only).")

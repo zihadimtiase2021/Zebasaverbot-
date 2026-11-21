@@ -17,13 +17,13 @@ import time
 from telethon import Button, errors, events
 
 from unified_core.utils import short_error
-from unified_services import watermark
+from unified_services import ui, watermark
 from unified_services.runtime_config import NUMBERS, TOGGLES, wm_status
 
 log = logging.getLogger("zeba.menus")
 B = Button.inline
-MAIN = [B("🔙 Main menu", b"menu")]
-ON = lambda v: "ON ✅" if v else "OFF ❌"  # noqa: E731
+MAIN = ui.main_row()
+ON = ui.onoff
 
 WM_SW = {"WM_ENABLED": "📥 Media sent to bot", "WM_ON_URL": "🔗 Downloaded links", "WM_ON_FWD": "🔁 Forwarded media"}
 SET_SW = {"INCLUDE_SOURCE_LINK": "🔗 Source link", "COMMENTS_ENABLED": "💬 Repost comments",
@@ -93,20 +93,22 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
                [B("📍 Position", b"m:pos"), B("📏 Size / rotate", b"m:look")],
                *sw_rows(WM_SW, c),
                [B("👁 Preview", b"m:prev"), B("🧹 Reset", b"m:wmreset")], MAIN]
-        return wm_status(rt()) + "\n\n<i>Tap a button to change it. Switches decide where the watermark is used.</i>", btn
+        return wm_status(rt()) + "\n\n" + ui.hint("Tap a button to change it. The switches decide where the watermark is used."), btn
 
     def s_look():
         c = rt().cfg
-        return ("📏 <b>Size, rotation & opacity</b>\nSize and margin are % of the picture width. Rotation: + turns the text counter-clockwise.",
+        return (ui.head("📏", "Size, rotation & opacity") + "\n"
+                + ui.hint("Size and margin are % of the picture width. Rotation: + turns the text counter-clockwise."),
                 [*num_row("WM_SIZE", "📏 Size", c, "%"), *num_row("WM_ANGLE", "🔄 Rotate", c, "°"),
                  *num_row("WM_OPACITY", "💧 Text opacity", c, "%"), *num_row("WM_BG_OPACITY", "🟫 Box opacity", c, "%"),
                  *num_row("WM_MARGIN", "↔️ Margin", c, "%"),
-                 [B("↺ Reset rotation", b"m:n:WM_ANGLE:0")], [B("👁 Preview", b"m:prev"), B("🔙 Back", b"m:wm")]])
+                 [B("↺ Reset rotation", b"m:n:WM_ANGLE:0"), B("👁 Preview", b"m:prev")], ui.nav_row(b"m:wm")])
 
     def s_pos():
         cur = rt().cfg.WM_POSITION
         rows = [[B(("✅ " if p == cur else "") + ARROW[p], f"m:ps:{p}".encode()) for p in r] for r in GRID]
-        return (f"📍 <b>Where should the watermark go?</b>\nNow: <b>{watermark.POSITIONS.get(cur, cur)}</b>"), rows + [[B("🔙 Back", b"m:wm")]]
+        return (ui.head("📍", "Where should the watermark go?", f"Now: <b>{watermark.POSITIONS.get(cur, cur)}</b>"),
+                rows + [ui.nav_row(b"m:wm")])
 
     def s_color(key: str):
         cur = getattr(rt().cfg, key)
@@ -121,7 +123,7 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
         extra = [B("✏️ Custom hex", f"m:ask:{key}".encode())]
         if key == "WM_BG_COLOR":
             extra.insert(0, B("🚫 No box", f"m:cs:{key}:none".encode()))
-        return f"🎨 <b>{title}</b>\nNow: <b>{html.escape(cur)}</b>", rows + [extra, [B("🔙 Back", b"m:wm")]]
+        return ui.head("🎨", title, f"Now: <b>{html.escape(cur)}</b>"), rows + [extra, ui.nav_row(b"m:wm")]
 
     def fonts_for(flt: str) -> list[str]:
         names = watermark.list_fonts(rt().cfg.DATA_DIR)
@@ -138,25 +140,20 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
         btns = [B(("✅ " if n == cur else "") + n[:28], f"m:fs:{flt}:{page * FONTS_PER_PAGE + i}".encode())
                 for i, n in enumerate(chunk)]
         rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
-        nav = []
-        if page > 0:
-            nav.append(B("◀️", f"m:fp:{flt}:{page - 1}".encode()))
-        nav.append(B(f"{page + 1}/{pages}", b"m:noop"))
-        if page < pages - 1:
-            nav.append(B("▶️", f"m:fp:{flt}:{page + 1}".encode()))
+        nav = ui.pager_row(f"m:fp:{flt}:", page, pages)
         sw = B("🇧🇩 Bangla fonts", b"m:fp:b:0") if flt == "a" else B("🔤 All fonts", b"m:fp:a:0")
-        msg = (f"🔤 <b>Font</b> — now: <b>{html.escape(cur)}</b>\n"
-               "For Bangla text choose a Bengali font. Send a <b>.ttf / .otf</b> file here to add your own.")
+        msg = (ui.head("🔤", "Font", f"Now: <b>{html.escape(cur)}</b>") + "\n"
+               + ui.hint("For Bangla text choose a Bengali font. Send a .ttf / .otf file here to add your own."))
         if not names:
-            msg += "\n\n<i>No fonts found" + (" (no Bengali font installed)." if flt == "b" else ".")
-        return msg, rows + [nav, [sw, B("🔙 Back", b"m:wm")]]
+            msg += "\n\n" + ui.hint("No fonts found" + (" (no Bengali font installed)." if flt == "b" else "."))
+        return msg, rows + [nav, [sw], ui.nav_row(b"m:wm")]
 
     def s_settings():
         c = rt().cfg
         t = rt().target_info()
-        txt = ("⚙️ <b>Settings</b>\n"
-               f"🎯 Target channel: <b>{html.escape(str(t['title']))}</b> <code>{t['id']}</code>\n"
-               "Changes apply to the next post and are saved.")
+        txt = (ui.head("⚙️", "Settings") + "\n"
+               f"🎯 Target channel: <b>{html.escape(str(t['title']))}</b> <code>{t['id']}</code>\n\n"
+               + ui.hint("Changes apply to the next post and are saved."))
         return txt, [[B("🎯 Change target channel", b"m:tg")], *sw_rows(SET_SW, c),
                      *num_row("MAX_COMMENTS", "💬 Max comments", c), MAIN]
 
@@ -165,10 +162,11 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
         cur = rt().target_info()["id"]
         rows = [[B(("✅ " if ch["id"] == cur else "") + ch["name"][:40], f"m:tp:{i}".encode())]
                 for i, ch in enumerate(chans[:20])]
-        txt = "🎯 <b>Choose the target channel</b>\nThe account must be an admin with 'Post messages'."
+        txt = (ui.head("🎯", "Choose the target channel") + "\n"
+               + ui.hint("The account must be an admin with “Post messages”."))
         if not chans:
-            txt += "\n\n<i>No channel list available - enter it by hand.</i>"
-        return txt, rows + [[B("✏️ Enter id / @username / link", b"m:ask:TARGET")], [B("🔙 Back", b"m:set")]]
+            txt += "\n\n" + ui.hint("No channel list available — enter it by hand.")
+        return txt, rows + [[B("✏️ Enter id / @username / link", b"m:ask:TARGET")], ui.nav_row(b"m:set")]
 
     async def s_translation():
         tr = app.pipeline.translator
@@ -180,8 +178,9 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
                 rows.append(row)
                 row = []
         rows.append(row) if row else None
-        txt = "🌐 <b>Translation</b>\n" + html.escape(await tr.describe()) + "\n\nPick a provider (auto = use .env order):"
-        return txt, rows + [[B("🧪 Test providers", b"m:trt"), B("🔙 Main menu", b"menu")]]
+        txt = (ui.head("🌐", "Translation") + "\n" + html.escape(await tr.describe()) + "\n\n"
+               + ui.hint("Pick a provider (auto = use the .env order)."))
+        return txt, rows + [[B("🧪 Test providers", b"m:trt")], MAIN]
 
     def s_forward():
         fw = fwd()
@@ -193,21 +192,21 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
                            f"m:fo:{i}".encode()),
                          B("⏹ Stop" if busy else "📥 All", f"m:{'fx' if busy else 'fl'}:{i}".encode()),
                          B("🗑", f"m:fd:{i}".encode())])
-        head = fw._fmt_routes().split("\n\n")[0] if fw.routes else "🔁 <b>Forward routes</b>\nNo routes yet."
+        head = fw._fmt_routes().split("\n\n")[0] if fw.routes else ui.head("🔁", "Forward routes", "No routes yet.")
         many = len(fw_accounts()) > 1
         if many:
             head = f"👤 <b>Account: {html.escape(fw_entry()[1])}</b>\n" + head
-        txt = (head + "\n\n👁/⏸ = watch new messages on/off (tap the route) · 📥 All = Forward all: copy the whole "
-               "source, only what was not copied before · 🗑 deletes the route.")
+        txt = (head + "\n\n" + ui.hint("👁/⏸ watch new messages on/off (tap the route) · 📥 All = copy the whole source, "
+                                       "only what was not copied before · 🗑 deletes the route."))
         extra = []
         if fw.routes:
             extra.append([B("📥 Forward all (every route)", b"m:fl:0"), B("📊 Progress", b"m:fg")])
         if len(fw.routes) > 1:
             from unified_services.forwarder import MIX_BATCH
             extra.append([B(f"🔀 Mixing: {ON(fw.mixing)}", b"m:fm")])
-            txt += (f"\n\n🔀 Mixing ON = Forward all over several routes sends {MIX_BATCH} messages per route in "
-                    f"turns (route 1: 1-{MIX_BATCH}, route 2: 1-{MIX_BATCH}, route 1: {MIX_BATCH + 1}-{MIX_BATCH * 2} …). "
-                    "OFF = one route after the other.")
+            txt += ("\n" + ui.hint(f"🔀 Mixing ON = Forward all over several routes sends {MIX_BATCH} messages per route "
+                                    f"in turns (route 1: 1-{MIX_BATCH}, route 2: 1-{MIX_BATCH}, route 1: "
+                                    f"{MIX_BATCH + 1}-{MIX_BATCH * 2} …). OFF = one route after the other."))
         who_row = [[B(f"👤 Account: {fw_entry()[1][:24]}  ▸ change", b"m:fac")]] if many else []
         return txt, who_row + rows + extra + [
             [B("➕ Add route", b"m:fa"), B("🗑 Bulk delete", b"m:bdl")],
@@ -216,8 +215,7 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
 
     def s_progress():
         fw = fwd()
-        return (fw._fmt_progress() + "\n\n<i>Tap 📊 Progress again to refresh.</i>",
-                [[B("📊 Refresh", b"m:fg"), B("🔙 Back", b"m:fw")]])
+        return (fw._fmt_progress(), [[B(ui.L_REFRESH, b"m:fg")], ui.nav_row(b"m:fw")])
 
     def s_accounts():
         """Which account's forwarding the Forward screens show / change."""
@@ -226,18 +224,19 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
         for uid, label, a in fw_accounts():
             n = len(getattr(getattr(a, "forwarder", None), "routes", []) or [])
             rows.append([B(f"{'✅ ' if uid == cur else ''}{label[:26]} · {n} route(s)", f"m:fas:{uid}".encode())])
-        txt = ("👤 <b>Choose the account</b>\nEvery account has its own routes. The Forward screen shows and changes the "
-               "routes of the account you pick here — that account reads the source and posts to the destination.")
-        return txt, rows + [[B("🔙 Back", b"m:fw")]]
+        txt = (ui.head("👤", "Choose the account") + "\n"
+               + ui.hint("Every account has its own routes. The Forward screen shows and changes the routes of the "
+                         "account you pick here — that account reads the source and posts to the destination."))
+        return txt, rows + [ui.nav_row(b"m:fw")]
 
     def s_bans():
         fw = fwd()
         rows = [[B(f"{b[:30]}", b"m:noop"), B("🗑", f"m:bd:{i}".encode())] for i, b in enumerate(fw.bans)]
-        txt = ("🚫 <b>Ban list</b>\nThese words / links / @names are removed from every forwarded caption "
-               "(the rest of the text stays).")
+        txt = (ui.head("🚫", "Ban list") + "\n"
+               + ui.hint("These words / links / @names are removed from every forwarded caption (the rest of the text stays)."))
         if not fw.bans:
-            txt += "\n\n<i>Nothing banned yet.</i>"
-        return txt, rows[:40] + [[B("➕ Add words / links", b"m:ask:BAN")], [B("🔙 Back", b"m:fw")]]
+            txt += "\n\n" + ui.hint("Nothing banned yet.")
+        return txt, rows[:40] + [[B("➕ Add words / links", b"m:ask:BAN")], ui.nav_row(b"m:fw")]
 
     # ------------------------------------------------------------------ plumbing
     async def put(event, screen, edit: bool = True) -> None:
@@ -253,17 +252,19 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
     async def ask(event, kind: str, prompt: str, back: bytes) -> None:
         getattr(app, "editing", {}).pop(event.sender_id, None)   # a product edit in progress is dropped
         pending[event.sender_id] = {"kind": kind, "back": back}
-        await event.edit(prompt + "\n\n<i>Send it as a message now.</i>", buttons=[[B("❌ Cancel", b"m:cancel")]])
+        await event.edit(prompt + "\n\n" + ui.hint("Send it as a message now."), buttons=[ui.cancel_row()])
 
     PROMPTS = {
-        "WM_TEXT": "✏️ <b>Watermark text</b>\nSend the text (e.g. <code>@mychannel</code>). Several lines are fine.",
-        "WM_TEXT_COLOR": "🎨 Send the <b>text color</b>: a name (<code>white</code>) or hex (<code>#ffcc00</code>).",
-        "WM_BG_COLOR": "🎨 Send the <b>box color</b>: a name, hex, or <code>none</code> for no box.",
-        "TARGET": "🎯 Send the channel <code>@username</code>, <code>t.me</code> link or <code>-100…</code> id.",
-        "BAN": "🚫 <b>Ban words</b>\nSend words, phrases, links or @names — separate several with a comma or a new line.",
-        "BD_START": "🗑 <b>Bulk delete — step 1/2</b>\nSend the link of the <b>first</b> (oldest) message to delete, "
-                    "e.g. <code>https://t.me/c/2940625991/2236</code>",
-        "FWD_SRC": "📤 <b>Step 1/2</b> — send the <b>source</b> chat (<code>@username</code>, link or id).",
+        "WM_TEXT": ui.head("✏️", "Watermark text", "Send the text (e.g. <code>@mychannel</code>). Several lines are fine."),
+        "WM_TEXT_COLOR": ui.head("🎨", "Text color", "Send a name (<code>white</code>) or hex (<code>#ffcc00</code>)."),
+        "WM_BG_COLOR": ui.head("🎨", "Box color", "Send a name, hex, or <code>none</code> for no box."),
+        "TARGET": ui.head("🎯", "Target channel", "Send the channel <code>@username</code>, <code>t.me</code> link "
+                                                  "or <code>-100…</code> id."),
+        "BAN": ui.head("🚫", "Ban words", "Send words, phrases, links or @names — separate several with a comma or a new line."),
+        "BD_START": ui.head("🗑", "Bulk delete") + "\n" + ui.step(1, 2, "send the link of the <b>first</b> (oldest) message "
+                    "to delete, e.g. <code>https://t.me/c/2940625991/2236</code>"),
+        "FWD_SRC": ui.head("📤", "Add route") + "\n" + ui.step(1, 2, "send the <b>source</b> chat "
+                    "(<code>@username</code>, link or id)."),
     }
     BACKS = {"WM_TEXT": b"m:wm", "WM_TEXT_COLOR": b"m:wm", "WM_BG_COLOR": b"m:wm", "TARGET": b"m:set",
              "FWD_SRC": b"m:fw", "FWD_DST": b"m:fw", "BAN": b"m:bn",
@@ -330,7 +331,7 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
                 return await put(event, s_fonts(p[2], int(p[3]) // FONTS_PER_PAGE))
             if a == "fu":  # font that was just uploaded
                 await rt().set_string("WM_FONT", ":".join(p[2:]))
-                return await event.edit("✅ Font selected.", buttons=[[B("💧 Watermark menu", b"m:wm")]])
+                return await event.edit(ui.ok("Font selected."), buttons=[[B("💧 Watermark menu", b"m:wm")], MAIN])
             if a == "t":
                 key = p[2]
                 if key not in TOGGLES:
@@ -351,8 +352,9 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
                 await event.answer("Sending preview…")
                 return await wm_handlers.send_preview(bot, event.chat_id)
             if a == "wmreset":
-                return await event.edit("🧹 Clear the watermark text and switch all watermark options off?",
-                                        buttons=[[B("✅ Yes, reset", b"m:wmreset2"), B("❌ No", b"m:wm")]])
+                return await event.edit(ui.head("🧹", "Reset watermark?", "This clears the watermark text and switches all "
+                                                                      "watermark options off."),
+                                        buttons=[ui.confirm_row("🧹 Yes, reset", b"m:wmreset2", b"m:wm")])
             if a == "wmreset2":
                 await rt().set_string("WM_TEXT", "")
                 for k in WM_SW:
@@ -372,8 +374,8 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
             if a == "trt":
                 await event.answer("Testing every provider…")
                 res = await app.pipeline.translator.diagnose()
-                return await event.edit("🧪 <b>Translation test</b>\n" + html.escape(res),
-                                        buttons=[[B("🔙 Back", b"m:tr")]])
+                return await event.edit(ui.head("🧪", "Translation test") + "\n" + html.escape(res)[:3800],
+                                        buttons=[ui.nav_row(b"m:tr")])
             if a in ("fo", "fd"):
                 i = int(p[2])
                 fw = fwd()
@@ -390,7 +392,7 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
                 if i and not 1 <= i <= len(fw.routes):
                     return await put(event, s_forward())
                 ans = fw.start_all([fw.routes[i - 1]] if i else list(fw.routes))
-                await event.answer(ans.replace("<b>", "").replace("</b>", "").split("\n")[0][:190], alert=True)
+                await event.answer(ui.plain(ans), alert=True)
                 return await put(event, s_forward())
             if a == "fx":      # stop a running Forward all
                 i = int(p[2])
@@ -402,8 +404,7 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
                 return await put(event, s_progress())
             if a == "fm":      # Mixing ON / OFF
                 fw = fwd()
-                await event.answer((await fw.set_mixing(not fw.mixing)).replace("<b>", "").replace("</b>", "")[:190],
-                                   alert=True)
+                await event.answer(ui.plain(await fw.set_mixing(not fw.mixing)), alert=True)
                 return await put(event, s_forward())
             if a == "bdl":     # Bulk delete: step 1
                 plans.pop(event.sender_id, None)
@@ -425,21 +426,24 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
                 plan = st["plan"]
                 run = running[event.sender_id] = {"stop": False}
                 stop_btn = [[B("⏹ Stop", b"m:bds")]]
-                await event.edit(f"⏳ Deleting {plan.total} id(s) in chunks of {bulk_delete.CHUNK}…", buttons=stop_btn)
+                await event.edit(ui.head("⏳", "Deleting…", f"{plan.total} id(s) in chunks of {bulk_delete.CHUNK}"),
+                                 buttons=stop_btn)
                 last_edit = [0.0]
 
                 async def progress(res, event=event, plan=plan):
                     if time.time() - last_edit[0] < 3:      # editing on every chunk would earn a FloodWait
                         return
                     last_edit[0] = time.time()
-                    await event.edit(f"⏳ Deleting… {res.done_to - plan.start + 1}/{plan.total} checked · "
-                                     f"🗑 {res.deleted} deleted", buttons=stop_btn)
+                    checked = res.done_to - plan.start + 1
+                    await event.edit(ui.head("⏳", "Deleting…", f"<code>{ui.bar(checked, plan.total)}</code>\n"
+                                                                f"{checked}/{plan.total} checked · 🗑 {res.deleted} deleted"),
+                                     buttons=stop_btn)
                 try:
                     res = await bulk_delete.delete_range(st["client"], plan, progress,
                                                          should_stop=lambda: run["stop"])
                 finally:
                     running.pop(event.sender_id, None)
-                return await event.edit(res.text(), buttons=[[B("🔁 Forward menu", b"m:fw")], MAIN])
+                return await event.edit(res.text(), buttons=[ui.nav_row(b"m:fw", back_label="🔁 Forward menu")])
             if a == "fk":
                 fw = fwd()
                 await fw._cmd_fwd("links off" if fw.strip_links else "links on")
@@ -510,9 +514,9 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
                                            f"route, so it is used.\n{ans}")
         choices[event.sender_id] = {"src": src, "dst": dst, "back": back}
         rows = [[B(f"👤 {label[:30]}", f"m:fcs:{uid}".encode())] for uid, label, _a in ok]
-        await event.respond("📤 <b>Step 3/3</b> — more than one account is a member of both chats.\n"
-                            "Which account should read the source and post to the destination?" + note,
-                            buttons=rows + [[B("❌ Cancel", b"m:cancel")]])
+        await event.respond(ui.head("📤", "Add route") + "\n" + ui.step(3, 3, "more than one account is a member of both "
+                            "chats.\nWhich account should read the source and post to the destination?") + note,
+                            buttons=rows + [ui.cancel_row()])
 
     # ------------------------------------------------------------------ typed answers
     @bot.on(events.NewMessage(func=lambda e: e.is_private and not e.media and bool(e.raw_text)
@@ -526,10 +530,10 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
         try:
             if kind in ("WM_TEXT", "WM_TEXT_COLOR", "WM_BG_COLOR"):
                 res = await rt().set_string(kind, event.raw_text.strip() if kind == "WM_TEXT" else val)
-                return await home(event, back, f"✅ Saved: <b>{html.escape(res)}</b>")
+                return await home(event, back, ui.ok(f"Saved: <b>{html.escape(res)}</b>"))
             if kind == "TARGET":
                 title = await rt().set_target(val)
-                return await home(event, back, f"✅ Now posting to <b>{html.escape(title)}</b>")
+                return await home(event, back, ui.ok(f"Now posting to <b>{html.escape(title)}</b>"))
             if kind == "BAN":
                 ans = await fwd()._cmd_fwd("ban " + event.raw_text)
                 return await home(event, back, ans.split("\n")[0])
@@ -537,20 +541,21 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
                 from unified_core.tg import parse_message_link
                 parse_message_link(val)                    # reject a bad link now, not after the second one
                 pending[event.sender_id] = {"kind": "BD_END", "back": back, "start": val}
-                return await event.respond("🗑 <b>Bulk delete — step 2/2</b>\nNow send the link of the <b>last</b> "
-                                           "(newest) message to delete, e.g. <code>https://t.me/c/2940625991/2255</code>",
-                                           buttons=[[B("❌ Cancel", b"m:cancel")]])
+                return await event.respond(
+                    ui.head("🗑", "Bulk delete") + "\n" + ui.step(2, 2, "now send the link of the <b>last</b> (newest) "
+                    "message to delete, e.g. <code>https://t.me/c/2940625991/2255</code>"),
+                    buttons=[ui.cancel_row()])
             if kind == "BD_END":
                 from unified_services import bulk_delete
                 client = fwd().userbot
                 plan = await bulk_delete.make_plan(client, st["start"], val)
                 plans[event.sender_id] = {"plan": plan, "client": client, "back": back, "ts": time.time()}
                 return await event.respond(plan.summary(), buttons=[
-                    [B(f"✅ Yes, delete {plan.total}", b"m:bdy"), B("❌ Cancel", b"m:cancel")]])
+                    ui.confirm_row(f"🗑 Yes, delete {plan.total}", b"m:bdy", b"m:cancel")])
             if kind == "FWD_SRC":
                 pending[event.sender_id] = {"kind": "FWD_DST", "back": back, "src": val}
-                return await event.respond("📥 <b>Step 2/2</b> — send the <b>destination</b> chat.",
-                                           buttons=[[B("❌ Cancel", b"m:cancel")]])
+                return await event.respond(ui.head("📥", "Add route") + "\n" + ui.step(2, 2, "send the <b>destination</b> chat."),
+                                           buttons=[ui.cancel_row()])
             if kind == "FWD_DST":
                 if len(fw_accounts()) > 1:
                     return await choose_account(event, st["src"], val, back)
@@ -558,11 +563,11 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
                 return await home(event, back, ans)
         except ValueError as exc:
             pending[event.sender_id] = st  # let them try again
-            return await event.respond(f"❌ {html.escape(str(exc))}\nTry again, or cancel.",
-                                       buttons=[[B("❌ Cancel", b"m:cancel")]])
+            return await event.respond(ui.fail(html.escape(str(exc)), "") + "\n" + ui.hint("Try again, or cancel."),
+                                       buttons=[ui.cancel_row()])
         except Exception as exc:
             log.exception("typed answer failed")
-            await event.respond(f"❌ Failed: {html.escape(short_error(exc))}")
+            await event.respond(ui.fail("Failed", short_error(exc)), buttons=[ui.nav_row(back)])
 
 
 def s_wm_entry(app):

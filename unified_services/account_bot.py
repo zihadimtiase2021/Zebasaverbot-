@@ -12,6 +12,7 @@ from telethon import Button, errors, events
 from unified_core import pyro_login as pl
 from unified_core.config import settings
 from unified_core.utils import esc, flood_seconds, short_error
+from unified_services import ui
 from unified_services.accounts import AccountError, AccountManager, clean_key
 
 log = logging.getLogger("zeba.accounts.bot")
@@ -85,7 +86,7 @@ def code_buttons(sent) -> list:
     rows = []
     if has_next(sent):
         rows.append([Button.inline("📩 Send the code another way", b"acc:resend")])
-    rows.append([Button.inline("✖️ Cancel", b"acc:cancel")])
+    rows.append(ui.cancel_row(b"acc:cancel"))
     return rows
 
 
@@ -160,7 +161,7 @@ def render_accounts(manager: AccountManager) -> tuple[str, list]:
     lines.append("\n<i>Logout keeps the session valid and gives you a key; /resume &lt;key&gt; brings it back.</i>")
     if len(rows) < settings.MAX_ACCOUNTS:
         buttons.append([Button.inline("➕ Add account", b"acc:login")])
-    buttons.append([Button.inline("🔙 Back", b"menu")])
+    buttons.append(ui.nav_row(None, close=True))
     return "\n".join(lines), buttons
 
 
@@ -553,7 +554,7 @@ def register_account_commands(app, manager: AccountManager, is_admin) -> None:
             await reply(event, "🔁 " + code_prompt(sent, st["phone"]), buttons=code_buttons(sent))
 
     async def do_logout(event, uid_target: int, terminate: bool, edit_it: bool) -> None:
-        back = [[Button.inline("👥 Accounts", b"acc:list")]]
+        back = [ui.nav_row(b"acc:list", back_label="👥 Accounts")]
 
         async def out(text, buttons=None):
             if edit_it:
@@ -637,9 +638,8 @@ def register_account_commands(app, manager: AccountManager, is_admin) -> None:
             return await reply(event, "❌ No such account. See /accounts for the numbers.")
         if terminate:
             return await reply(
-                event, "🗑 <b>Terminate</b> ends the Telegram session for good — the key stops working.\nSure?",
-                buttons=[[Button.inline("🗑 Yes, terminate", f"acc:termy:{uid}".encode()),
-                          Button.inline("Cancel", b"acc:list")]])
+                event, ui.head("🗑", "Terminate this account?", "This ends the Telegram session for good — the key stops working."),
+                buttons=[ui.confirm_row("🗑 Yes, terminate", f"acc:termy:{uid}", b"acc:list")])
         await do_logout(event, uid, terminate=False, edit_it=False)
 
     @bot.on(events.NewMessage(pattern=r"(?s)^/resume(?:@\w+)?(?:\s+(.+))?$", func=lambda e: e.is_private))
@@ -738,9 +738,8 @@ def register_account_commands(app, manager: AccountManager, is_admin) -> None:
             return
         await answer(event)
         uid = int(event.data_match.group(1))
-        await edit(event, event, "🗑 <b>Terminate</b> ends the Telegram session for good — the key stops working.\nSure?",
-                   buttons=[[Button.inline("🗑 Yes, terminate", f"acc:termy:{uid}".encode()),
-                             Button.inline("Cancel", b"acc:list")]])
+        await edit(event, event, ui.head("🗑", "Terminate this account?", "This ends the Telegram session for good — the key stops working."),
+                   buttons=[ui.confirm_row("🗑 Yes, terminate", f"acc:termy:{uid}", b"acc:list")])
 
     @bot.on(events.CallbackQuery(data=re.compile(rb"^acc:termy:(\d+)$")))
     @guard
