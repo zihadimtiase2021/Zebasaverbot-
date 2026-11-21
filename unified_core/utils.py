@@ -215,3 +215,10 @@ def ffmpeg_location() -> str | None:
             except Exception:
                 _FFMPEG = None
     return _FFMPEG
+
+
+def flood_seconds(exc: BaseException) -> int | None:
+    """Seconds Telegram asks us to wait when `exc` is a flood / slow-mode error (any variant), else None."""
+    if any(c.__name__.startswith(("Flood", "SlowMode")) and c.__name__.endswith("Error") for c in type(exc).__mro__):
+        return max(1, int(getattr(exc, "seconds", 0) or 1))
+    return None

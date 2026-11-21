@@ -19,6 +19,8 @@ import json
 import logging
 from typing import Iterable
 
+from unified_core.utils import flood_seconds
+
 log = logging.getLogger("zeba.fwd.ledger")
 
 TAG = "#zeba_fwd_ledger"
@@ -191,21 +193,31 @@ class Ledger:
             from unified_core.utils import NOTIFY_MARK  # lazy: keeps this module importable on its own
 
             body = f"{NOTIFY_MARK}\U0001f9fe Zeba forward ledger (please do not delete)\n{TAG}\n{text}"
-            try:
-                if self.msg_id:
-                    try:
-                        await self.userbot.edit_message("me", self.msg_id, body, parse_mode=None)
-                        return
-                    except Exception as exc:
-                        if "not modified" in str(exc).lower():
+            for attempt in range(3):
+                try:
+                    if self.msg_id:
+                        try:
+                            await self.userbot.edit_message("me", self.msg_id, body, parse_mode=None)
                             return
-                        log.info("ledger message could not be edited (%s) - sending a new one", exc)
-                        self.msg_id = None
-                m = await self.userbot.send_message("me", body, parse_mode=None)
-                self.msg_id = m.id
-            except Exception as exc:
-                self._dirty = True  # try again with the next change / at shutdown
-                log.warning("could not save the forward ledger to Saved Messages: %s", exc)
+                        except Exception as exc:
+                            if "not modified" in str(exc).lower():
+                                return
+                            if flood_seconds(exc) is not None:
+                                raise                  # wait and edit the SAME message: no second ledger copy
+                            log.info("ledger message could not be edited (%s) - sending a new one", exc)
+                            self.msg_id = None
+                    m = await self.userbot.send_message("me", body, parse_mode=None)
+                    self.msg_id = m.id
+                    return
+                except Exception as exc:
+                    wait = flood_seconds(exc)
+                    if wait is not None and wait <= 120 and attempt < 2:
+                        log.warning("saving the forward ledger: FloodWait %ss", wait)
+                        await asyncio.sleep(wait + 1)
+                        continue
+                    self._dirty = True  # try again with the next change / at shutdown
+                    log.warning("could not save the forward ledger to Saved Messages: %s", exc)
+                    return
 
     async def close(self) -> None:
         if self._task is not None and not self._task.done():

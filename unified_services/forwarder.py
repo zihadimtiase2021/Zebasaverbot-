@@ -49,6 +49,9 @@ log = logging.getLogger("zeba.forward")
 ROUTES_KEY = "FWD_ROUTES"
 BAN_KEY = "FWD_BAN"
 LINKS_KEY = "FWD_LINKS"
+MIX_KEY = "FWD_MIX"
+JOBS_KEY = "FWD_JOBS"                           # routes whose "Forward all" is running -> resumed after a redeploy
+MIX_BATCH = 5                                  # messages per route and turn in Mixing mode
 TEXT_LIMIT = 4096
 NO_CAPTION = {"sticker", "video_note"}        # Telegram cannot attach a caption to these
 _COMMAND = re.compile(r"^\.[A-Za-z]+(\s|$)")  # my own ".dl", ".fwdsrc" ... messages are never copied
@@ -153,6 +156,10 @@ class Forwarder:
         self.routes: list[dict] = []       # {"src","dst","src_name","dst_name","active"}
         self.bans: list[str] = []          # words / urls cut out of copied captions
         self.strip_links = bool(settings.FWD_STRIP_LINKS)   # remove every link from copied text
+        self.resume_keys: list[str] = []   # route keys with an unfinished Forward all (saved in Saved Messages)
+        self._shutting_down = False        # True while the process stops: interrupted jobs must stay on the list
+        self._bg_tasks: set = set()
+        self.mixing = False                # Forward all over several routes: 5 messages per route, round-robin
         self.ledger = Ledger(userbot, db)  # what was copied already (per route) + serial counter
         self.jobs: dict[str, dict] = {}    # route key -> progress of a running / finished "Forward all"
         self.pending: dict | None = None   # source chosen with .fwdsrc, waiting for .fwddst
@@ -184,6 +191,10 @@ class Forwarder:
                      else banwords.split_bans(getattr(settings, "FWD_BAN", "")))
         if self.store is not None and isinstance(self.store.saved.get(LINKS_KEY), bool):
             self.strip_links = self.store.saved[LINKS_KEY]
+        if self.store is not None and isinstance(self.store.saved.get(MIX_KEY), bool):
+            self.mixing = self.store.saved[MIX_KEY]
+        if self.store is not None and isinstance(self.store.saved.get(JOBS_KEY), list):
+            self.resume_keys = [k for k in self.store.saved[JOBS_KEY] if isinstance(k, str)]
         await self.ledger.load()
         if self.routes:
             log.info("Forwarding: %d route(s) loaded", len(self.routes))
@@ -197,6 +208,7 @@ class Forwarder:
         self._worker = asyncio.create_task(self._run(), name="zeba-forwarder")
 
     async def stop(self, grace: float = 20.0) -> None:
+        self._shutting_down = True                   # the jobs below are interrupted, not finished: keep them saved
         for job in self.jobs.values():
             job["stop"] = True                       # Forward all: stop reading, drop what is not copied yet
         tasks = [j["task"] for j in self.jobs.values() if j.get("task") is not None]
@@ -225,6 +237,8 @@ class Forwarder:
             self.store.saved[ROUTES_KEY] = self.routes
             self.store.saved[BAN_KEY] = self.bans
             self.store.saved[LINKS_KEY] = self.strip_links
+            self.store.saved[MIX_KEY] = self.mixing
+            self.store.saved[JOBS_KEY] = list(self.resume_keys)
             try:
                 await self.store.save()
             except Exception as exc:
@@ -304,6 +318,8 @@ class Forwarder:
                 status = await self._copy(item)
                 if job is not None:
                     job[status] = job.get(status, 0) + 1
+                    if status == "sent":           # last message of this route that was really forwarded
+                        job["last_id"] = max(job.get("last_id", 0), max(m.id for m in item.msgs))
                     job["streak"] = 0
             except asyncio.CancelledError:
                 raise
@@ -432,6 +448,7 @@ class Forwarder:
         if not routes:
             raise ValueError("no routes yet - create one with .fwdsrc / .fwddst")
         started, running = [], []
+        new_jobs: list[tuple[dict, dict]] = []
         for r in routes:
             old = self._job_for(r)
             if old is not None and old["state"] == "running":
@@ -440,16 +457,33 @@ class Forwarder:
             job = {"state": "running", "src": r["src"], "dst": r["dst"], "src_name": r["src_name"],
                    "dst_name": r["dst_name"], "stop": False, "pending": 0, "scanned": 0, "sent": 0, "seen": 0,
                    "skipped": 0, "empty": 0, "stopped": 0, "failed": 0, "failed_ids": [], "streak": 0,
-                   "total": 0, "note": "", "started": time.time(), "task": None}
+                   "total": 0, "note": "", "started": time.time(), "task": None, "last_id": 0, "mixed": False}
             self.jobs[route_key(r["src"], r["dst"])] = job
-            job["task"] = asyncio.create_task(self._backfill(r, job), name="zeba-fwd-all")
+            new_jobs.append((r, job))
             started.append(r)
+        if new_jobs:                              # saved first: a redeploy right now still resumes these routes
+            for r, _job in new_jobs:
+                k = route_key(r["src"], r["dst"])
+                if k not in self.resume_keys:
+                    self.resume_keys.append(k)
+            self._spawn(self._persist())
+        if self.mixing and len(new_jobs) > 1:     # Mixing: ONE task takes turns between the routes
+            for _r, job in new_jobs:
+                job["mixed"] = True
+            task = asyncio.create_task(self._mix_backfill(new_jobs), name="zeba-fwd-mix")
+            for _r, job in new_jobs:
+                job["task"] = task
+        else:
+            for r, job in new_jobs:
+                job["task"] = asyncio.create_task(self._backfill(r, job), name="zeba-fwd-all")
         if not started:
             return "⏳ Forward all is already running for " + (
                 "that route" if len(routes) == 1 else "these routes") + ". <code>.fwd progress</code>"
         names = ", ".join(f"{esc(r['src_name'])} ➜ {esc(r['dst_name'])}" for r in started)
         extra = f"\n(already running: {len(running)})" if running else ""
-        return (f"📥 <b>Forward all</b> started: {names}{extra}\n"
+        mode = (f"\n🔀 <b>Mixing ON</b>: {MIX_BATCH} messages per route, taking turns"
+                if len(new_jobs) > 1 and self.mixing else "")
+        return (f"📥 <b>Forward all</b> started: {names}{extra}{mode}\n"
                 "Only messages that were <b>not copied before</b> are sent, oldest first, each with its serial number.\n"
                 "<code>.fwd progress</code> · <code>.fwd stop</code>")
 
@@ -463,23 +497,24 @@ class Forwarder:
                 n += 1
         return n
 
-    async def _queue_group(self, job: dict, route: dict, msgs: list) -> None:
+    async def _queue_group(self, job: dict, route: dict, msgs: list) -> bool:
         key = route_key(route["src"], route["dst"])
         ids = [m.id for m in msgs]
         if self.ledger.has_all(key, ids):
             job["seen"] += 1
-            return
+            return False
         if not any(self._copyable(route["src"], m) for m in msgs):
             for i in ids:                      # service message / empty: resolved, never looked at again
                 self.ledger.add(key, i)
             job["skipped"] += 1
-            return
+            return False
         while job["pending"] >= 20 and not job["stop"]:   # leave room in the queue for the live watcher
             await asyncio.sleep(0.2)
         if job["stop"]:
-            return
+            return False
         job["pending"] += 1
         await self._q.put(Item(route["src"], [route], msgs, job))
+        return True                            # queued (Mixing counts only these toward its 5 per turn)
 
     async def _backfill(self, route: dict, job: dict) -> None:
         key = route_key(route["src"], route["dst"])
@@ -526,10 +561,176 @@ class Forwarder:
         finally:
             job["task"] = None
             await self.ledger.flush()
+            await self._job_ended(job)
             try:
                 await self.pipeline.notify(self._fmt_job(job, final=True))
             except Exception as exc:
                 log.debug("could not send the Forward all summary: %s", exc)
+
+    # ---------------------------------------------------------------- Mixing (several routes, taken in turns)
+    async def _iter_groups(self, route: dict, job: dict, floor: int):
+        """Yield the not yet resolved messages of a route's source, oldest first; an album is ONE group."""
+        group: list = []
+        async for m in self.userbot.iter_messages(route["src"], reverse=True, min_id=floor):
+            if job["stop"] or route not in self.routes:
+                job["stop"] = True
+                return
+            job["scanned"] += 1
+            gid = getattr(m, "grouped_id", None)
+            if group and (not gid or gid != getattr(group[0], "grouped_id", None)):
+                yield group
+                group = []
+            if gid:
+                group.append(m)
+            else:
+                yield [m]
+        if group and not job["stop"]:
+            yield group
+
+    async def _mix_backfill(self, pairs: list[tuple[dict, dict]]) -> None:
+        """Forward all for several routes in turns: MIX_BATCH messages of route 1, then of route 2 ... then the next
+        MIX_BATCH of route 1 ... A route that runs out of messages simply drops out of the rotation. Every route
+        keeps its own job / ledger, so the result is the same as separate runs - only the ORDER is mixed."""
+        states = []
+        for route, job in pairs:
+            key = route_key(route["src"], route["dst"])
+            floor = self.ledger.resume_from(key)
+            states.append({"route": route, "job": job, "key": key, "last": floor, "done": False,
+                           "gen": self._iter_groups(route, job, floor)})
+        try:
+            for st in states:
+                try:
+                    st["job"]["total"] = int((await self.userbot.get_messages(st["route"]["src"], limit=0)).total or 0)
+                except Exception as exc:
+                    log.debug("could not count the messages of %s: %s", st["route"]["src"], exc)
+            while any(not st["done"] for st in states):
+                for st in states:
+                    if st["done"]:
+                        continue
+                    job, route = st["job"], st["route"]
+                    taken = 0
+                    while taken < MIX_BATCH:           # this route's turn: up to 5 messages that really need sending
+                        if job["stop"] or route not in self.routes:
+                            job["stop"] = True
+                            st["done"] = True
+                            break
+                        try:
+                            group = await st["gen"].__anext__()
+                        except StopAsyncIteration:
+                            st["done"] = True          # fewer than 5 left: the turn just ends early
+                            break
+                        st["last"] = max(st["last"], max(m.id for m in group))
+                        if await self._queue_group(job, route, group):
+                            taken += len(group)        # an album is never cut in the middle
+                    if job["stop"]:
+                        st["done"] = True
+        except asyncio.CancelledError:
+            for st in states:
+                st["job"]["state"] = "stopped"
+            raise
+        except Exception as exc:
+            log.exception("mixed forward all failed")
+            for st in states:
+                st["job"]["state"] = "failed"
+                st["job"]["note"] = short_error(exc)
+                st["job"]["stop"] = True
+        finally:
+            for st in states:                          # an early stop must not leave the readers half-open
+                try:
+                    await st["gen"].aclose()
+                except Exception as exc:
+                    log.debug("could not close the reader of %s: %s", st["route"].get("src_name"), exc)
+            for st in states:
+                await self._finish_mixed(st)
+
+    async def _finish_mixed(self, st: dict) -> None:
+        job = st["job"]
+        try:
+            while job["pending"] > 0:
+                await asyncio.sleep(0.5)
+            if job["state"] == "running":
+                if job["failed_ids"]:
+                    limit = min(job["failed_ids"]) - 1
+                else:
+                    limit = 0 if job["stop"] else st["last"]
+                if limit >= 1:
+                    self.ledger.add(st["key"], 1, limit)
+                job["state"] = "stopped" if job["stop"] else ("done with errors" if job["failed"] else "done")
+        except Exception as exc:
+            log.exception("could not finish a mixed job")
+            job["state"] = "failed"
+            job["note"] = short_error(exc)
+        finally:
+            job["task"] = None
+            await self.ledger.flush()
+            await self._job_ended(job)
+            try:
+                await self.pipeline.notify(self._fmt_job(job, final=True))
+            except Exception as exc:
+                log.debug("could not send the Forward all summary: %s", exc)
+
+    # ---------------------------------------------------------------- resume after a redeploy
+    def _spawn(self, coro) -> None:
+        """Run a coroutine in the background (start_all is a plain function, the save is async)."""
+        try:
+            t = asyncio.get_running_loop().create_task(coro)
+        except RuntimeError:                       # no running loop (plain unit tests)
+            coro.close()
+            return
+        self._bg_tasks.add(t)
+        t.add_done_callback(self._bg_tasks.discard)
+
+    async def _job_ended(self, job: dict) -> None:
+        """A Forward all ended by itself (finished / stopped by the person / failed): it must not restart later.
+        When the process is shutting down the job was only interrupted, so it stays on the list."""
+        if self._shutting_down:
+            return
+        key = route_key(job["src"], job["dst"])
+        if key in self.resume_keys:
+            self.resume_keys.remove(key)
+            try:
+                await self._persist()
+            except Exception as exc:
+                log.warning("could not update the saved Forward all list: %s", exc)
+
+    async def clear_resume(self) -> None:
+        if self.resume_keys:
+            self.resume_keys.clear()
+            await self._persist()
+
+    async def resume_jobs(self) -> int:
+        """At start-up: continue every Forward all that was running when the bot stopped. The ledger knows what was
+        already copied, so only the rest is sent (and nothing twice). Returns the number of routes resumed."""
+        if not self.resume_keys:
+            return 0
+        by_key = {route_key(r["src"], r["dst"]): r for r in self.routes}
+        gone = [k for k in self.resume_keys if k not in by_key]
+        if gone:                                    # route deleted meanwhile
+            self.resume_keys = [k for k in self.resume_keys if k in by_key]
+            await self._persist()
+        routes = [by_key[k] for k in self.resume_keys]
+        if not routes:
+            return 0
+        try:
+            self.start_all(routes)
+        except ValueError as exc:                   # e.g. FWD_ENABLED=false: stay saved, try again next start
+            log.warning("Forward all not resumed: %s", exc)
+            return 0
+        names = ", ".join(f"{esc(r['src_name'])} ➜ {esc(r['dst_name'])}" for r in routes)
+        try:
+            await self.pipeline.notify(f"🔄 <b>Forward all resumed</b> after the restart: {names}\n"
+                                       "Only what was not copied yet is sent.")
+        except Exception as exc:
+            log.debug("could not send the resume notice: %s", exc)
+        return len(routes)
+
+    async def set_mixing(self, on: bool) -> str:
+        self.mixing = on
+        await self._persist()
+        if on:
+            return (f"🔀 Mixing <b>ON</b>: Forward all over several routes sends {MIX_BATCH} messages of route 1, "
+                    f"then {MIX_BATCH} of route 2 … and starts again until every route is finished.")
+        return "🔀 Mixing <b>OFF</b>: routes are forwarded one after the other (default)."
 
     def _fmt_job(self, job: dict, final: bool = False) -> str:
         icon = {"running": "⏳", "done": "✅", "done with errors": "⚠️", "stopped": "⏹", "failed": "❌"}.get(
@@ -538,6 +739,8 @@ class Forwarder:
         head = f"{icon} <b>Forward all</b> {esc(job['src_name'])} ➜ {esc(job['dst_name'])} — {esc(job['state'])}"
         body = (f"\n📤 copied: <b>{job['sent']}</b> · ⏭ already copied: {job['seen']} · "
                 f"🚫 skipped: {job['skipped'] + job['empty']} · ❌ failed: {job['failed']}\n🔎 looked at: {scanned}")
+        if job.get("last_id"):
+            body += f"\n🏁 last forwarded message ID: <b>{job['last_id']}</b>" + (" · 🔀 mixed" if job.get("mixed") else "")
         if job["failed"] and final:
             body += "\nFailed ones stay open: run <code>.fwd all</code> again to retry only those."
         if job["note"]:
@@ -647,6 +850,8 @@ class Forwarder:
         "Or in one line: <code>.fwd @source @destination</code>\n"
         "👁 <b>Watch</b>: every new message of the source is copied automatically — "
         "<code>.fwd watch [n]</code> / <code>.fwd unwatch [n]</code>\n"
+        "🔀 <b>Mixing</b>: <code>.fwd mix on|off</code> — with several routes, <code>.fwd all</code> sends 5 messages "
+        "per route in turns\n"
         "📥 <b>Forward all</b>: <code>.fwd all [n]</code> copies the whole source, but only what was not copied yet "
         "· <code>.fwd progress</code> · <code>.fwd stop [n]</code>\n"
         "<code>.fwd list</code> · <code>.fwd del n</code> · <code>.fwd clear</code> · <code>.fwd id 123</code> · "
@@ -749,6 +954,8 @@ class Forwarder:
             lines.append(f"{i}. {'👁' if r['active'] else '⏸'} {esc(r['src_name'])} <code>{r['src']}</code> ➜ "
                          f"{esc(r['dst_name'])} <code>{r['dst']}</code> · {done} copied")
         lines.append(f"\n👁 = watching new messages · ⏸ = paused · 🔗 links removed: {'yes' if self.strip_links else 'no'}")
+        if len(self.routes) > 1:
+            lines.append(f"🔀 Mixing: {'ON' if self.mixing else 'OFF'} (Forward all: {MIX_BATCH} messages per route in turns)")
         if not settings.FWD_ENABLED:
             lines.append("⚠️ FWD_ENABLED=false: copying is switched off in the environment.")
         return "\n".join(lines)
@@ -803,6 +1010,11 @@ class Forwarder:
             await self._persist()
             return (f"{'👁 Watching' if on else '⏸ Paused'}: {len(targets)} route(s).\n"
                     + ("New messages of the source are copied automatically.\n" if on else "") + self._fmt_routes())
+        if sub in ("mix", "mixing"):
+            if rest.lower() not in ("on", "off"):
+                return (f"🔀 Mixing is <b>{'ON ✅' if self.mixing else 'OFF ❌'}</b>. "
+                        "Use <code>.fwd mix on</code> / <code>.fwd mix off</code>")
+            return await self.set_mixing(rest.lower() == "on")
         if sub == "all":
             return self.start_all(self._pick(rest))
         if sub in ("stop", "cancel"):

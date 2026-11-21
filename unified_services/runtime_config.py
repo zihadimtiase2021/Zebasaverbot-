@@ -17,11 +17,12 @@ import json
 import logging
 import time
 
-from unified_core.utils import NOTIFY_MARK
+from unified_core.utils import NOTIFY_MARK, flood_seconds
 
 log = logging.getLogger("zeba.runtime")
 
 TAG = "#zeba_config"
+MAX_CHARS = 4000          # one Saved Messages message holds 4096 characters
 
 # key -> (label, description)
 TOGGLES: dict[str, tuple[str, str]] = {
@@ -153,20 +154,38 @@ class RuntimeConfig:
         return {}
 
     async def save(self) -> None:
+        """Write the settings message (edit it, or send a new one). A FloodWait is waited out and the SAME message is
+        edited again - it must never end in a second copy of the settings."""
         async with self._lock:
             text = (f"{NOTIFY_MARK}\u2699\ufe0f Zeba runtime settings (please do not delete)\n{TAG}\n"
-                    f"{json.dumps(self.saved, sort_keys=True)}")
-            if self.msg_id:
+                    f"{json.dumps(self.saved, sort_keys=True, separators=(',', ':'))}")
+            if len(text) > MAX_CHARS:
+                log.error("runtime settings are %d characters - more than one Saved Messages message holds (%d); "
+                          "NOT saved (remove routes / ban words)", len(text), MAX_CHARS)
+                raise ValueError("the saved settings are too big for one Saved Messages message - "
+                                 "remove some routes or ban words")
+            for attempt in range(3):
                 try:
-                    await self.userbot.edit_message("me", self.msg_id, text, parse_mode=None)
+                    if self.msg_id:
+                        try:
+                            await self.userbot.edit_message("me", self.msg_id, text, parse_mode=None)
+                            return
+                        except Exception as exc:
+                            if "not modified" in str(exc).lower():
+                                return
+                            if flood_seconds(exc) is not None:
+                                raise
+                            log.info("settings message could not be edited (%s) - sending a new one", exc)
+                            self.msg_id = None
+                    m = await self.userbot.send_message("me", text, parse_mode=None)
+                    self.msg_id = m.id
                     return
                 except Exception as exc:
-                    if "not modified" in str(exc).lower():
-                        return
-                    log.info("settings message could not be edited (%s) - sending a new one", exc)
-                    self.msg_id = None
-            m = await self.userbot.send_message("me", text, parse_mode=None)
-            self.msg_id = m.id
+                    wait = flood_seconds(exc)
+                    if wait is None or wait > 120 or attempt == 2:
+                        raise
+                    log.warning("saving the settings: FloodWait %ss", wait)
+                    await asyncio.sleep(wait + 1)
 
     # ------------------------------------------------------------------ changes
     async def set_toggle(self, key: str, value: bool) -> None:

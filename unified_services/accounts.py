@@ -111,6 +111,7 @@ class AccountManager:
         self.primary_name = primary_name
         self.primary_username = primary_username
         self.instances: dict[int, Instance] = {}
+        self.vault = None   # StateVault: the extra accounts' sessions, encrypted, in the primary's Saved Messages
         self._lock = asyncio.Lock()
         self._stopping = 0  # logouts in progress: a key must not be used while its old connection is still closing
 
@@ -233,6 +234,7 @@ class AccountManager:
             self.instances[me.id] = inst
         if source == "login":
             await db.account_save(me.id, inst.name, inst.phone, key)
+            await self._vault_set(inst, key)
         log.info("Account %s (id=%s) is running (%d total)", inst.label, me.id, self.total)
         return inst
 
@@ -302,6 +304,7 @@ class AccountManager:
             app.forwarder = forwarder
             queue.start(settings.EXTRA_ACCOUNT_WORKERS)
             await resume_batches(app, primary=False)
+            await forwarder.resume_jobs()       # a Forward all that was running before the redeploy continues
             inst.monitor = asyncio.create_task(self._watch(inst), name=f"zeba-watch-{me.id}")
         except Exception:
             await inst.stop()
@@ -320,6 +323,11 @@ class AccountManager:
         terminated = False
         try:
             await db.account_delete(user_id)
+            await self._vault_drop(user_id)
+            try:
+                await inst.forwarder.clear_resume()   # a logged-out account must not restart its Forward all later
+            except Exception:
+                log.debug("could not clear the saved jobs of %s", inst.label)
             try:
                 await inst.stop(terminate=terminate)
                 terminated = terminate
@@ -351,6 +359,7 @@ class AccountManager:
         log.warning("Account %s lost its session", inst.label)
         self.instances.pop(inst.me_id, None)
         await db.account_delete(inst.me_id)
+        await self._vault_drop(inst.me_id)
         await inst.stop()
         await self.primary.pipeline.notify(
             f"⚠️ <b>{_h(inst.label)}</b> was logged out by Telegram (session ended elsewhere). "
@@ -360,7 +369,14 @@ class AccountManager:
     async def restore(self) -> int:
         """At start-up: bring back the accounts stored in the database and those in EXTRA_SESSIONS."""
         started = 0
-        todo = [(r["session"], "login", r["user_id"]) for r in await db.accounts_all()]
+        rows = await db.accounts_all()
+        todo = [(r["session"], "login", r["user_id"]) for r in rows]
+        if self.vault is not None:      # accounts kept in Saved Messages: they come back after a redeploy wiped the DB
+            known = {r["user_id"] for r in rows}
+            for uid, key, _label in self.vault.sessions():
+                if uid not in known:
+                    todo.append((key, "login", uid))
+                    log.info("Account %s restored from the encrypted state in Saved Messages", uid)
         todo += [(k, "env", None) for k in split_keys(settings.EXTRA_SESSIONS)]
         for key, source, uid in todo:
             try:
@@ -372,12 +388,28 @@ class AccountManager:
                 log.warning("Could not restore an account: %s", exc)
                 if uid is not None:  # permanent problem: forget it here, the admin still has the key
                     await db.account_delete(uid)
+                    if not str(exc).startswith("Could not connect"):   # a network hiccup must not lose the saved login
+                        await self._vault_drop(uid)
                 await self.primary.pipeline.notify(
                     f"⚠️ <b>An extra account was not started:</b> {_h(str(exc))}"
                     + (f"\n🔑 <code>{_h(key)}</code>\nFix it, then <code>/resume</code> this key." if uid is not None else ""))
             except Exception:
                 log.exception("restoring an account failed (kept for the next start)")
         return started
+
+    async def _vault_set(self, inst: "Instance", key: str) -> None:
+        if self.vault is not None:
+            try:
+                await self.vault.set_account(inst.me_id, inst.label, key)
+            except Exception:
+                log.exception("could not save the account to the Saved Messages state")
+
+    async def _vault_drop(self, user_id: int) -> None:
+        if self.vault is not None:
+            try:
+                await self.vault.drop_account(user_id)
+            except Exception:
+                log.exception("could not remove the account from the Saved Messages state")
 
     async def stop_all(self) -> None:
         for uid in list(self.instances):

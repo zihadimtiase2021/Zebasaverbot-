@@ -352,6 +352,14 @@ class Database:
         await self.conn.commit()
         self._changed(300.0)
 
+    async def fwd_set_caption(self, uid: str, caption: str) -> bool:
+        """The ORIGINAL caption of a copy after the admin edited it (/find -> Edit). False when the serial is unknown."""
+        cur = await self.conn.execute("UPDATE fwd_log SET caption = ? WHERE uid = ? AND dst_msg IS NOT NULL",
+                                      ((caption or "")[:3500], uid))
+        await self.conn.commit()
+        self._changed(20.0)
+        return cur.rowcount > 0
+
     async def fwd_set_note(self, uid: str, note: str | None) -> bool:
         """Admin note of a copy ('' / None clears it). False when the serial number is unknown."""
         cur = await self.conn.execute("UPDATE fwd_log SET note = ?, note_auto = 0 WHERE uid = ? AND dst_msg IS NOT NULL",

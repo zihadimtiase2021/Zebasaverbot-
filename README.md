@@ -286,3 +286,65 @@ The account in `SESSION_STRING` (or the session file) is the **primary** one. An
   (an account that comes from `EXTRA_SESSIONS` returns after a restart even if you logged it out - remove its key there too).
 * `EXTRA_ACCOUNT_WORKERS` (default 2) = download/upload workers per extra account.
 * If Telegram ends a session from outside (Settings → Devices), the bot notices, drops the account and tells you.
+
+
+## Mixing mode & Bulk delete
+
+* **Mixing** (Bot → Forward menu, shown when 2+ routes exist; or `.fwd mix on|off`): *Forward all* over several routes
+  sends 5 messages of route 1, then 5 of route 2, then the next 5 of route 1 … until every route is finished. A route
+  with fewer than 5 messages left simply drops out of the rotation; albums are never split. Each route keeps its own
+  ledger / last forwarded message ID (shown in 📊 Progress). OFF (default) = routes run one after the other.
+* **Bulk delete** (Bot → Forward menu → 🗑 Bulk delete): send the *first* and the *last* message link
+  (`https://t.me/c/2940625991/2236` … `https://t.me/c/2940625991/2255`, or public `t.me/<username>/<id>`). Both must be
+  in the same chat; after a confirmation screen every message from start to end (inclusive) is deleted in chunks of
+  100 by the selected account (it needs the "Delete messages" right for other people's messages). Missing ids are
+  skipped, FloodWait is waited out, and a range is capped at 20,000 ids. While it runs the message shows a
+  **⏹ Stop** button (what was already deleted stays deleted); only one bulk delete runs per admin, and an unconfirmed
+  confirmation screen expires after 10 minutes.
+
+### Production hardening notes
+* Every Saved Messages writer (settings `#zeba_config`, ledger `#zeba_fwd_ledger`, account state `#zeba_state`) waits out a
+  FloodWait and edits the **same** message again - it never leaves a second, stale copy. Settings that would not fit
+  into one message (4096 characters) are refused with a clear error instead of being lost silently.
+* Uploads / downloads retry on every flood variant (FloodWait, SlowMode, Premium flood), not only plain FloodWait.
+* Mixing closes its per-route readers when a run stops early.
+* Buttons use one vocabulary everywhere: 🔙 Back (one step up), ❌ Cancel (abort a prompt), ✖ Close (dismiss a panel).
+
+
+## Surviving redeploys (no disk needed)
+
+Everything the bot must remember lives in your Telegram **Saved Messages**, as small tagged messages that are
+updated automatically whenever something changes and read again at every start:
+
+| Message tag | Holds | Written by |
+|---|---|---|
+| `#zeba_config` | settings, forward routes, Mixing on/off, link removal, ban words, **running Forward all jobs** | each account, in its own Saved Messages |
+| `#zeba_fwd_ledger` | forwarding progress: copied id ranges per route + serial counter | each account |
+| `#zeba_fwd_backup` | product ids / notes (gzip file) | primary account |
+| `#zeba_state` | **extra accounts' sessions, encrypted** (new) | primary account |
+
+* **Extra accounts** (`/login`) come back by themselves after a redeploy - no `/resume <key>` any more. Their keys are
+  encrypted (HMAC-SHA256 stream + MAC, key derived with PBKDF2) with `STATE_KEY`, or - if you do not set it - with a key
+  derived from `API_HASH` + `CONTROL_BOT_TOKEN`. If that secret changes, the saved keys stay untouched but cannot be read.
+* **Forward all** that was running at the redeploy continues on its own (admin gets a "resumed" notice). The ledger
+  guarantees nothing is copied twice. A job you stop, delete or that finishes is removed from the list and never restarts;
+  `/logout` of an account clears its list too.
+* **The primary login cannot live in Saved Messages**: they can only be read *with* a working login. Keep it in
+  `SESSION_STRING` (`python -m scripts.export_session`) or on a persistent disk. The bot logs a warning at start when it
+  runs on a session file.
+
+
+## ✏️ Edit a product (`/find`)
+
+Every product shown by `/find` has an **✏️ Edit** button (under the file; for an album in a small message right after it).
+It opens a panel with **🖼 File**, **📝 Caption**, **🔒 Details** and **✖ Close**; every step has **⬅️ Back** / **❌ Cancel**.
+
+* **File**: send the new photo / video / document. It replaces the file of the copy in the destination channel (an album
+  asks which file). The caption of that message is kept. The watermark switch for forwarded media applies to it too.
+* **Caption**: send the new text (formatting kept, `-` clears it). The serial (`ZF-000042`) is put back at the end.
+* **Details**: the private note (record only, never posted; `-` deletes it).
+* The channel message is edited **first** (by the account that posted it, otherwise another account that can open the chat);
+  only when Telegram accepted it, the database record changes - so record and live message never disagree.
+* Deleted channel message: caption / details are still saved in the record and the answer says the message is gone;
+  a new file cannot be saved (nothing to put it on). Short FloodWait is waited out; a long one is reported and nothing changes.
+  No edit right, caption too long or a file type Telegram refuses are explained in plain words.

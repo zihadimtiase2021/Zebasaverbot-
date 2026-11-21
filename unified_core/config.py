@@ -78,6 +78,10 @@ class Settings(BaseSettings):
     EXTRA_SESSIONS: str = ""           # optional: session keys (space/comma separated) started with the bot - survives
                                        # hosts whose disk is wiped on restart (Render free)
 
+    # --- Persistence across redeploys ---
+    STATE_KEY: str = ""                # secret that encrypts the extra accounts' session keys kept in Saved Messages
+                                       # (empty = derived from API_HASH + CONTROL_BOT_TOKEN)
+
     # --- Routing ---
     TARGET_CHANNEL: int = 0   # where media is posted
     COMMENT_CHAT: int = 0     # discussion group (fallback for comment replies)

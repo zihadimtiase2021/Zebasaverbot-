@@ -12,7 +12,7 @@ from telethon import TelegramClient, errors, types
 from unified_core.cleanup import dir_size, safe_rmtree
 from unified_core.config import settings
 from unified_core.database import db
-from unified_core.utils import NOTIFY_MARK, esc, human_size, normalize_url, short_error
+from unified_core.utils import NOTIFY_MARK, esc, flood_seconds, human_size, normalize_url, short_error
 from unified_services import watermark
 from unified_services.captions import build_caption
 from unified_services.downloader import fetch_post
@@ -254,11 +254,12 @@ class Pipeline:
         for attempt in range(settings.MAX_RETRIES + 1):
             try:
                 return await factory()
-            except errors.FloodWaitError as exc:
-                if exc.seconds > 600 or attempt == settings.MAX_RETRIES:
+            except errors.FloodError as exc:       # FloodWait, SlowModeWait, FloodPremiumWait ...
+                wait = flood_seconds(exc) or 1
+                if wait > 600 or attempt == settings.MAX_RETRIES:
                     raise
-                log.warning("FloodWait %ss", exc.seconds)
-                await asyncio.sleep(exc.seconds + 1)
+                log.warning("FloodWait %ss", wait)
+                await asyncio.sleep(wait + 1)
             except (ConnectionError, OSError, asyncio.TimeoutError, errors.ServerError) as exc:
                 if attempt == settings.MAX_RETRIES:
                     raise

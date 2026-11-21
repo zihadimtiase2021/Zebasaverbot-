@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextvars
 import html
 import logging
+import time
 
 from telethon import Button, errors, events
 
@@ -40,7 +41,11 @@ FONTS_PER_PAGE = 8
 def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
     pending: dict[int, dict] = {}  # admin id -> what the next text message is for
     choices: dict[int, dict] = {}  # admin id -> new route waiting for "which account should copy it?"
+    plans: dict[int, dict] = {}    # admin id -> bulk delete waiting for the confirmation {"plan", "client", "back"}
     sel: dict[int, int] = {}       # admin id -> user id of the account whose Forward screens are shown
+    running: dict[int, dict] = {}  # admin id -> bulk delete that is running now {"stop": bool}
+    PLAN_TTL = 600                 # seconds a bulk delete confirmation stays valid
+    app._menu_pending = pending    # find edit (edit_cmds) clears a half-finished prompt of the same admin
     who: contextvars.ContextVar[int] = contextvars.ContextVar("zeba_menu_admin", default=0)
 
     # ------------------------------------------------------------------ accounts (primary + extra userbots)
@@ -197,9 +202,15 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
         extra = []
         if fw.routes:
             extra.append([B("📥 Forward all (every route)", b"m:fl:0"), B("📊 Progress", b"m:fg")])
+        if len(fw.routes) > 1:
+            from unified_services.forwarder import MIX_BATCH
+            extra.append([B(f"🔀 Mixing: {ON(fw.mixing)}", b"m:fm")])
+            txt += (f"\n\n🔀 Mixing ON = Forward all over several routes sends {MIX_BATCH} messages per route in "
+                    f"turns (route 1: 1-{MIX_BATCH}, route 2: 1-{MIX_BATCH}, route 1: {MIX_BATCH + 1}-{MIX_BATCH * 2} …). "
+                    "OFF = one route after the other.")
         who_row = [[B(f"👤 Account: {fw_entry()[1][:24]}  ▸ change", b"m:fac")]] if many else []
         return txt, who_row + rows + extra + [
-            [B("➕ Add route", b"m:fa")],
+            [B("➕ Add route", b"m:fa"), B("🗑 Bulk delete", b"m:bdl")],
             [B(f"🔗 Remove links: {ON(fw.strip_links)}", b"m:fk"), B(f"🚫 Ban words ({len(fw.bans)})", b"m:bn")],
             MAIN]
 
@@ -240,6 +251,7 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
             await event.respond(text, buttons=buttons)
 
     async def ask(event, kind: str, prompt: str, back: bytes) -> None:
+        getattr(app, "editing", {}).pop(event.sender_id, None)   # a product edit in progress is dropped
         pending[event.sender_id] = {"kind": kind, "back": back}
         await event.edit(prompt + "\n\n<i>Send it as a message now.</i>", buttons=[[B("❌ Cancel", b"m:cancel")]])
 
@@ -249,10 +261,13 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
         "WM_BG_COLOR": "🎨 Send the <b>box color</b>: a name, hex, or <code>none</code> for no box.",
         "TARGET": "🎯 Send the channel <code>@username</code>, <code>t.me</code> link or <code>-100…</code> id.",
         "BAN": "🚫 <b>Ban words</b>\nSend words, phrases, links or @names — separate several with a comma or a new line.",
+        "BD_START": "🗑 <b>Bulk delete — step 1/2</b>\nSend the link of the <b>first</b> (oldest) message to delete, "
+                    "e.g. <code>https://t.me/c/2940625991/2236</code>",
         "FWD_SRC": "📤 <b>Step 1/2</b> — send the <b>source</b> chat (<code>@username</code>, link or id).",
     }
     BACKS = {"WM_TEXT": b"m:wm", "WM_TEXT_COLOR": b"m:wm", "WM_BG_COLOR": b"m:wm", "TARGET": b"m:set",
-             "FWD_SRC": b"m:fw", "FWD_DST": b"m:fw", "BAN": b"m:bn"}
+             "FWD_SRC": b"m:fw", "FWD_DST": b"m:fw", "BAN": b"m:bn",
+             "BD_START": b"m:fw", "BD_END": b"m:fw"}
 
     async def home(event, back: bytes, note: str = "") -> None:
         """After a typed value: confirmation + the screen the person came from, as a new message."""
@@ -288,6 +303,7 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
                     return await event.answer("Forwarding is not running.", alert=True)
                 return await put(event, s_forward())
             if a == "cancel":
+                plans.pop(event.sender_id, None)
                 ch = choices.pop(event.sender_id, None) or {}
                 back = pending.pop(event.sender_id, {}).get("back") or ch.get("back", b"m:wm")
                 return await put(event, SCREENS[back]())
@@ -384,6 +400,46 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
                 return await put(event, s_forward())
             if a == "fg":
                 return await put(event, s_progress())
+            if a == "fm":      # Mixing ON / OFF
+                fw = fwd()
+                await event.answer((await fw.set_mixing(not fw.mixing)).replace("<b>", "").replace("</b>", "")[:190],
+                                   alert=True)
+                return await put(event, s_forward())
+            if a == "bdl":     # Bulk delete: step 1
+                plans.pop(event.sender_id, None)
+                choices.pop(event.sender_id, None)
+                return await ask(event, "BD_START", PROMPTS["BD_START"], b"m:fw")
+            if a == "bds":     # Bulk delete: stop the running run
+                run = running.get(event.sender_id)
+                if run is None:
+                    return await event.answer("No bulk delete is running.", alert=True)
+                run["stop"] = True
+                return await event.answer("Stopping after the current batch…")
+            if a == "bdy":     # Bulk delete: confirmed
+                from unified_services import bulk_delete
+                st = plans.pop(event.sender_id, None)
+                if st is None or time.time() - st.get("ts", 0) > PLAN_TTL:
+                    return await event.answer("This confirmation expired - start the bulk delete again.", alert=True)
+                if event.sender_id in running:
+                    return await event.answer("A bulk delete is already running - stop it first.", alert=True)
+                plan = st["plan"]
+                run = running[event.sender_id] = {"stop": False}
+                stop_btn = [[B("⏹ Stop", b"m:bds")]]
+                await event.edit(f"⏳ Deleting {plan.total} id(s) in chunks of {bulk_delete.CHUNK}…", buttons=stop_btn)
+                last_edit = [0.0]
+
+                async def progress(res, event=event, plan=plan):
+                    if time.time() - last_edit[0] < 3:      # editing on every chunk would earn a FloodWait
+                        return
+                    last_edit[0] = time.time()
+                    await event.edit(f"⏳ Deleting… {res.done_to - plan.start + 1}/{plan.total} checked · "
+                                     f"🗑 {res.deleted} deleted", buttons=stop_btn)
+                try:
+                    res = await bulk_delete.delete_range(st["client"], plan, progress,
+                                                         should_stop=lambda: run["stop"])
+                finally:
+                    running.pop(event.sender_id, None)
+                return await event.edit(res.text(), buttons=[[B("🔁 Forward menu", b"m:fw")], MAIN])
             if a == "fk":
                 fw = fwd()
                 await fw._cmd_fwd("links off" if fw.strip_links else "links on")
@@ -477,6 +533,20 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
             if kind == "BAN":
                 ans = await fwd()._cmd_fwd("ban " + event.raw_text)
                 return await home(event, back, ans.split("\n")[0])
+            if kind == "BD_START":
+                from unified_core.tg import parse_message_link
+                parse_message_link(val)                    # reject a bad link now, not after the second one
+                pending[event.sender_id] = {"kind": "BD_END", "back": back, "start": val}
+                return await event.respond("🗑 <b>Bulk delete — step 2/2</b>\nNow send the link of the <b>last</b> "
+                                           "(newest) message to delete, e.g. <code>https://t.me/c/2940625991/2255</code>",
+                                           buttons=[[B("❌ Cancel", b"m:cancel")]])
+            if kind == "BD_END":
+                from unified_services import bulk_delete
+                client = fwd().userbot
+                plan = await bulk_delete.make_plan(client, st["start"], val)
+                plans[event.sender_id] = {"plan": plan, "client": client, "back": back, "ts": time.time()}
+                return await event.respond(plan.summary(), buttons=[
+                    [B(f"✅ Yes, delete {plan.total}", b"m:bdy"), B("❌ Cancel", b"m:cancel")]])
             if kind == "FWD_SRC":
                 pending[event.sender_id] = {"kind": "FWD_DST", "back": back, "src": val}
                 return await event.respond("📥 <b>Step 2/2</b> — send the <b>destination</b> chat.",

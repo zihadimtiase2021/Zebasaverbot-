@@ -21,6 +21,7 @@ import html
 import logging
 import re
 import tempfile
+import types
 from datetime import datetime, timezone
 
 from telethon import events
@@ -101,6 +102,12 @@ def make_card(row: dict, account_label: str = "", compact: bool = False) -> str:
     if links:
         lines.append("  ·  ".join(links))
     return "\n\n".join(lines) if not compact else "\n".join(lines)
+
+
+def edit_buttons(row: dict) -> list:
+    """The Edit button under every product (handled by edit_cmds.py)."""
+    from telethon import Button
+    return [[Button.inline("✏️ Edit", f"fe:{row['uid']}".encode())]]
 
 
 def _is_truncated(row: dict) -> bool:
@@ -264,11 +271,13 @@ def register_find_commands(bot, is_admin, accounts=None, app=None) -> None:
         try:
             got = await download_preview(row, tmp) if clients() else None
             if not got:
-                return await event.respond(card_full, link_preview=False)
+                return await event.respond(card_full, link_preview=False, buttons=edit_buttons(row))
             paths, msgs = got
             caption = make_card(row, label(row.get("account")), compact=True)
             kw: dict = {"caption": caption, "parse_mode": "html"}
+            btn = edit_buttons(row)
             if len(msgs) == 1:
+                kw["buttons"] = btn                                      # an album cannot carry buttons
                 m = msgs[0]
                 kw.update(voice_note=bool(getattr(m, "voice", None)), video_note=bool(getattr(m, "video_note", None)),
                           supports_streaming=bool(getattr(m, "video", None)))
@@ -279,17 +288,23 @@ def register_find_commands(bot, is_admin, accounts=None, app=None) -> None:
                     getattr(x, "document", None) and not any(getattr(x, a, None) for a in ("photo", "video", "gif", "audio", "voice"))
                     for x in msgs)
             sent = None
+            on_file = False                                             # True: the Edit button sits on the file itself
             try:
                 sent = await event.client.send_file(event.chat_id, paths if len(paths) > 1 else paths[0], **kw)
+                on_file = "buttons" in kw
             except Exception as exc:                                    # e.g. photos + documents cannot share an album
                 log.info("album preview failed (%s) - sending the files one by one", exc)
                 for i, p in enumerate(paths):
                     one = await event.client.send_file(event.chat_id, p, caption=caption if i == 0 else None,
                                                        parse_mode="html")
                     sent = sent or one
+            first = sent[0] if isinstance(sent, (list, tuple)) else sent
             if kw.get("caption") is None or _is_truncated(row):         # the caption was cut: the full text follows
-                first = sent[0] if isinstance(sent, (list, tuple)) else sent
-                await event.respond(card_full, link_preview=False, reply_to=getattr(first, "id", None))
+                await event.respond(card_full, link_preview=False, reply_to=getattr(first, "id", None),
+                                    buttons=None if on_file else btn)
+            elif not on_file:                                            # album: the Edit button gets its own message
+                await event.respond(f"✏️ <b>{esc(row['uid'])}</b> · {len(paths)} file(s)", buttons=btn,
+                                    reply_to=getattr(first, "id", None))
         finally:
             safe_rmtree(tmp)
 
@@ -456,3 +471,6 @@ def register_find_commands(bot, is_admin, accounts=None, app=None) -> None:
         await event.respond(f"✅ Default note of <b>{esc(name)}</b> saved:\n🔒 {esc(text)}\n"
                             "It goes on every <b>new</b> product copied from there (and can be changed per product "
                             "with /addnote and /removenote).")
+
+    return types.SimpleNamespace(get_row=get_row, clients=clients, album_of=album_of, find_message=find_message,
+                                 label=label, card=make_card)

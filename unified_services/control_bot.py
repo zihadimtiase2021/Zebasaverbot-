@@ -77,7 +77,9 @@ def register_control_bot(app: App, accounts=None) -> None:
     from unified_services.bot_menus import register_bot_menus
     register_bot_menus(app, bot, is_admin, accounts)
     from unified_services.find_cmds import register_find_commands
-    register_find_commands(bot, is_admin, accounts, app)
+    found = register_find_commands(bot, is_admin, accounts, app)
+    from unified_services.edit_cmds import register_edit_commands
+    register_edit_commands(bot, is_admin, app, found)   # ✏️ Edit under every /find product
     if accounts is not None:
         from unified_services.account_bot import register_account_commands
         register_account_commands(app, accounts, is_admin)
@@ -138,14 +140,15 @@ def register_control_bot(app: App, accounts=None) -> None:
         except Exception:
             pass
 
-    @bot.on(events.Album(func=lambda e: e.is_private))
+    @bot.on(events.Album(func=lambda e: e.is_private and e.sender_id not in getattr(app, "editing", ())))
     async def wm_album(event):
         from unified_services import wm_handlers
 
         if is_admin(event.sender_id) and any(wm_handlers.media_kind(m) for m in event.messages):
             await run_wm(event, list(event.messages))
 
-    @bot.on(events.NewMessage(func=lambda e: e.is_private and e.media is not None and not e.grouped_id))
+    @bot.on(events.NewMessage(func=lambda e: e.is_private and e.media is not None and not e.grouped_id
+                              and e.sender_id not in getattr(app, "editing", ())))
     async def wm_media(event):
         if not is_admin(event.sender_id):
             return

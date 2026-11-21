@@ -35,6 +35,7 @@ from unified_services.forwarder import Forwarder  # noqa: E402
 from unified_services.fwd_backup import FwdBackup  # noqa: E402
 from unified_services.admin_panel import AdminPanel  # noqa: E402
 from unified_services.accounts import AccountManager  # noqa: E402
+from unified_services.state_backup import StateVault, default_secret  # noqa: E402
 from unified_services.userbot_handlers import on_job_result, register_userbot_handlers, resume_batches  # noqa: E402
 
 log = logging.getLogger("zeba")
@@ -77,6 +78,10 @@ async def main() -> int:
 
     # SESSION_STRING = login kept in an environment variable (Render & co have no terminal to log in with)
     session = StringSession(settings.SESSION_STRING.strip()) if settings.SESSION_STRING.strip() else str(settings.session_path)
+    if not settings.SESSION_STRING.strip():
+        log.warning("No SESSION_STRING: the login lives in a session FILE. On a host without a persistent disk it is "
+                    "lost at every redeploy - run  python -m scripts.export_session  once and put the result into "
+                    "SESSION_STRING (the primary login cannot be restored from Saved Messages: it is needed to read them).")
     def make_userbot(sess) -> TelegramClient:
         return TelegramClient(
             sess, settings.API_ID, settings.API_HASH,
@@ -172,6 +177,11 @@ async def main() -> int:
         app.forwarder = forwarder
         # more Telegram accounts: /login, /accounts, /logout, /resume <key> in the control bot
         accounts = AccountManager(app, primary_name=me.first_name or "", primary_username=me.username or "")
+        # extra accounts' logins survive a wiped database: encrypted copy in the primary's Saved Messages
+        accounts.vault = StateVault(userbot, default_secret(settings))
+        saved_accounts = await accounts.vault.load()
+        if saved_accounts:
+            log.info("State read from Saved Messages: %d extra account(s)", saved_accounts)
 
         if settings.CONTROL_BOT_TOKEN:
             try:
@@ -208,6 +218,12 @@ async def main() -> int:
         resumed = await resume_batches(app)  # unfinished .json/.txt batches continue where they stopped
         if resumed:
             log.info("Resumed %d unfinished batch(es)", resumed)
+        try:
+            jobs = await forwarder.resume_jobs()  # "Forward all" runs that were interrupted by the redeploy
+            if jobs:
+                log.info("Resumed Forward all on %d route(s)", jobs)
+        except Exception:
+            log.exception("could not resume the Forward all jobs")
         restored = await accounts.restore()  # extra accounts logged in earlier (database / EXTRA_SESSIONS)
         if restored:
             log.info("Started %d extra account(s)", restored)
