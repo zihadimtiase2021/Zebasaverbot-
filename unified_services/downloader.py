@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shutil
+import threading
 from pathlib import Path
 
 import yt_dlp
@@ -18,6 +20,25 @@ log = logging.getLogger("zeba.downloader")
 
 VIDEO_EXT = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+MEDIA_EXT = VIDEO_EXT | IMAGE_EXT
+# yt-dlp leftovers of an interrupted download / merge: "<id>.f137.mp4" (one stream), "*.part", "*.ytdl", "*.temp.*"
+_INTERMEDIATE_RE = re.compile(r"\.f[0-9A-Za-z_-]+$|\.temp$")
+_CANCEL_WAIT = 15.0  # seconds a cancelled yt-dlp thread gets to stop before we give up waiting
+
+
+def _is_final_media(p: Path) -> bool:
+    """A finished media file (not a directory, not a half-downloaded / unmerged yt-dlp stream)."""
+    return p.suffix.lower() in MEDIA_EXT and not _INTERMEDIATE_RE.search(p.stem) and p.is_file()
+
+
+def _free_name(path: Path, suffix: str) -> Path:
+    """`path` with another suffix that does not clash with an existing file (never overwrite a sibling)."""
+    out = path.with_suffix(suffix)
+    n = 0
+    while out.exists():
+        n += 1
+        out = path.with_name(f"{path.stem}_n{n}{suffix}")
+    return out
 
 
 def _normalize_image_sync(path: Path) -> Path:
@@ -26,22 +47,32 @@ def _normalize_image_sync(path: Path) -> Path:
         from PIL import Image
     except ImportError:
         return path
+    out: Path | None = None
     try:
         with Image.open(path) as img:
             w, h = img.size
             too_big = path.stat().st_size > 9 * 1024 * 1024 or (w + h) > 9500
             if path.suffix.lower() != ".webp" and not too_big:
                 return path
-            out_img = img.convert("RGB")
-        if too_big:
-            out_img.thumbnail((2560, 2560))
-        out = path.with_suffix(".jpg")
-        if out == path:
-            out = path.with_name(path.stem + "_n.jpg")
-        out_img.save(out, "JPEG", quality=90)
+            if img.mode in ("RGBA", "LA", "P") and ("transparency" in img.info or img.mode != "P"):
+                rgba = img.convert("RGBA")  # flatten transparency onto white (plain convert("RGB") makes it black)
+                out_img = Image.new("RGB", rgba.size, (255, 255, 255))
+                out_img.paste(rgba, mask=rgba.getchannel("A"))
+                rgba.close()
+            else:
+                out_img = img.convert("RGB")
+        try:
+            if too_big:
+                out_img.thumbnail((2560, 2560))
+            out = _free_name(path, ".jpg")
+            out_img.save(out, "JPEG", quality=90)
+        finally:
+            out_img.close()
         return out
     except Exception as exc:
         log.warning("image normalize failed for %s: %s", path.name, exc)
+        if out is not None:
+            out.unlink(missing_ok=True)  # never leave a half-written file behind
         return path
 
 
@@ -83,14 +114,40 @@ def _ytdlp_opts(out_dir: Path, max_bytes: int, cookies: Path | None, fmt: str | 
     return opts
 
 
-def _ytdlp_run(url: str, opts: dict):
+def _ytdlp_run(url: str, opts: dict, cancel: threading.Event | None = None):
+    opts = dict(opts)
+    if cancel is not None:
+        cancelled = getattr(yt_dlp.utils, "DownloadCancelled", Exception)
+
+        def _hook(_d) -> None:  # runs inside the download thread: the only way to stop yt-dlp mid-download
+            if cancel.is_set():
+                raise cancelled("job cancelled")
+
+        opts["progress_hooks"] = [*opts.get("progress_hooks", []), _hook]
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         return ydl.sanitize_info(info) if info else None
 
 
+async def _ytdlp_run_async(url: str, opts: dict):
+    """Run yt-dlp in a thread that STOPS when the job is cancelled / times out.
+
+    `asyncio.to_thread` cannot be interrupted: without this the thread would keep downloading into a work
+    directory that the pipeline has already deleted, re-creating files nobody cleans up.
+    """
+    cancel = threading.Event()
+    fut = asyncio.ensure_future(asyncio.to_thread(_ytdlp_run, url, opts, cancel))
+    fut.add_done_callback(lambda f: f.cancelled() or f.exception())  # mark the exception as retrieved
+    try:
+        return await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        cancel.set()
+        await asyncio.wait({fut}, timeout=_CANCEL_WAIT)  # let it unwind before the caller deletes the files
+        raise
+
+
 def _has_media(out_dir: Path) -> bool:
-    return any(p.suffix.lower() in VIDEO_EXT | IMAGE_EXT for p in out_dir.iterdir())
+    return any(_is_final_media(p) for p in out_dir.iterdir())
 
 
 async def _cookie_candidates(url: str, workdir: Path, data: PostData) -> list[tuple[str | None, Path | None]]:
@@ -101,8 +158,11 @@ async def _cookie_candidates(url: str, workdir: Path, data: PostData) -> list[tu
     src = settings.cookies_path
     if src:
         shared = workdir / "cookies.txt"
-        shutil.copy(src, shared)
-        out.append((None, shared))
+        try:
+            await asyncio.to_thread(shutil.copy, src, shared)
+            out.append((None, shared))
+        except OSError as exc:  # optional file: a missing / unreadable one must not block the download
+            log.warning("cookies file %s unusable, continuing without it: %s", src, exc)
     return out or [(None, None)]
 
 
@@ -114,7 +174,7 @@ async def _fetch_ytdlp(url: str, workdir: Path, max_bytes: int, data: PostData) 
     for account, cookies in await _cookie_candidates(url, workdir, data):
         for fmt in (None, "best"):
             try:
-                info = await asyncio.to_thread(_ytdlp_run, url, _ytdlp_opts(out_dir, max_bytes, cookies, fmt))
+                info = await _ytdlp_run_async(url, _ytdlp_opts(out_dir, max_bytes, cookies, fmt))
                 if info:
                     break
             except Exception as exc:
@@ -125,7 +185,7 @@ async def _fetch_ytdlp(url: str, workdir: Path, max_bytes: int, data: PostData) 
                     break  # this account is limited: go straight to the next one
         if info or _has_media(out_dir):
             break
-    if info is None and not any(out_dir.iterdir()):
+    if info is None and not _has_media(out_dir):  # (only stray .part files don't count: report the real error)
         raise DownloadError(short_error(last_err) if last_err else "yt-dlp returned nothing")
 
     # Metadata
@@ -144,10 +204,12 @@ async def _fetch_ytdlp(url: str, workdir: Path, max_bytes: int, data: PostData) 
             if c.get("text"):
                 data.comments.append(Comment(c["text"].strip(), c.get("author") or ""))
 
-    # Media files
-    for p in sorted(out_dir.iterdir()):
+    # Media files, in playlist / carousel order (file names alone would sort them alphabetically)
+    order = {str(e.get("id")): i for i, e in enumerate((info or {}).get("entries") or []) if e and e.get("id")}
+    files = sorted(out_dir.iterdir(), key=lambda p: (order.get(p.stem, len(order)), p.name))
+    for p in files:
         ext = p.suffix.lower()
-        if not p.is_file() or p.stat().st_size == 0:
+        if not _is_final_media(p) or p.stat().st_size == 0:
             continue
         if ext in VIDEO_EXT:
             data.media.append(MediaItem(p, "video"))
@@ -175,7 +237,9 @@ async def fetch_post(url: str, workdir: Path, userbot, max_bytes: int) -> PostDa
         if not data.media:
             raise DownloadError("No downloadable media found at this URL")
     except BaseException:
-        if data.comments_task is not None:  # nobody will consume the replies
-            data.comments_task.cancel()
+        task = data.comments_task
+        if task is not None:  # nobody will consume the replies
+            task.cancel()
+            task.add_done_callback(lambda t: t.cancelled() or t.exception())  # no "never retrieved" noise
         raise
     return data

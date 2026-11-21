@@ -22,6 +22,14 @@ from unified_services.translator import Translator
 log = logging.getLogger("zeba.pipeline")
 
 
+def _discard_task(task: asyncio.Task | None) -> None:
+    """Cancel a background task nobody will await and mark its outcome as retrieved (no asyncio warnings)."""
+    if task is None:
+        return
+    task.cancel()
+    task.add_done_callback(lambda t: t.cancelled() or t.exception())
+
+
 # ------------------------------------------------------------------ models
 @dataclass
 class JobResult:
@@ -102,26 +110,44 @@ class Pipeline:
 
         await db.job_start(key, job.url)
         workdir = settings.tmp_dir / uuid.uuid4().hex
-        workdir.mkdir(parents=True, exist_ok=True)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        timeout = settings.JOB_TIMEOUT or None
         try:
-            return await asyncio.wait_for(self._execute(job, workdir, key), settings.JOB_TIMEOUT)
+            workdir.mkdir(parents=True, exist_ok=True)
+            return await asyncio.wait_for(self._execute(job, workdir, key), timeout)
         except asyncio.CancelledError:
-            await db.job_finish(key, "failed", error="cancelled")
+            await self._finish(key, "failed", error="cancelled")
             raise
-        except asyncio.TimeoutError:
-            await db.job_finish(key, "failed", error="timeout")
-            return JobResult("failed", error="Timed out")
+        except asyncio.TimeoutError as exc:
+            # Since Python 3.11 this is also the builtin TimeoutError that a network call can raise by itself:
+            # only call it a job timeout when the job deadline has really passed.
+            if timeout and loop.time() - started >= timeout - 1:
+                await self._finish(key, "failed", error="timeout")
+                return JobResult("failed", error="Timed out")
+            err = short_error(exc)
+            log.warning("job failed for %s: network timeout (%s)", job.url, err)
+            await self._finish(key, "failed", error=err)
+            return JobResult("failed", error=err)
         except Exception as exc:
             err = short_error(exc)
             if isinstance(exc, DownloadError):
                 log.warning("download failed for %s: %s", job.url, err)
             else:
                 log.exception("job failed for %s", job.url)
-            await db.job_finish(key, "failed", error=err)
+            await self._finish(key, "failed", error=err)
             return JobResult("failed", error=err)
         finally:
             # Whatever happened (success, failure, timeout, cancel): nothing stays on disk.
             safe_rmtree(workdir)  # synchronous on purpose: must also run while being cancelled
+
+    @staticmethod
+    async def _finish(key: str, status: str, error: str | None = None, link: str | None = None) -> None:
+        """Record the outcome; a database hiccup must neither mask the real result nor skip the cleanup."""
+        try:
+            await db.job_finish(key, status, error=error, link=link)
+        except Exception as exc:
+            log.warning("could not record job %s as %s: %s", key, status, short_error(exc))
 
     async def notify(self, text: str) -> None:
         """Status message: to the admins in the control bot chat, else (fallback) to Saved Messages."""
@@ -150,12 +176,14 @@ class Pipeline:
 
     async def drain(self, timeout: float | None = None) -> None:
         """Wait for background comment posting; whatever is still running afterwards is cancelled."""
-        if self._bg:
-            await asyncio.wait(set(self._bg), timeout=timeout)
-        for t in list(self._bg):
+        pending = set(self._bg)
+        if pending:
+            await asyncio.wait(pending, timeout=timeout)
+        left = [t for t in set(self._bg) | pending if not t.done()]
+        for t in left:
             t.cancel()
-        if self._bg:
-            await asyncio.gather(*list(self._bg), return_exceptions=True)
+        if left:
+            await asyncio.gather(*left, return_exceptions=True)
 
     # ---- internals ----
     async def _execute(self, job: Job, workdir, key: str) -> JobResult:
@@ -207,11 +235,12 @@ class Pipeline:
                 self._spawn_comments(sent[0], tag, data, dest, route)
                 handed_off = True
 
-            await db.job_finish(key, "done", link=link or None)
+            # The post is live: recording it must not be able to turn this job into a "failure" (-> duplicate retry).
+            await self._finish(key, "done", link=link or None)
             return JobResult("done", link=link, comments=queued)
         finally:
-            if not handed_off and data is not None and data.comments_task is not None:
-                data.comments_task.cancel()
+            if not handed_off and data is not None:
+                _discard_task(data.comments_task)
 
     def _spawn_comments(self, post_msg, tag: str, data: PostData, dest: int | None = None, route=None) -> None:
         task = asyncio.create_task(self._comments_worker(post_msg, tag, data, dest, route), name=f"zeba-comments-{tag}")
@@ -281,8 +310,8 @@ class Pipeline:
             res = await self._retry(go)
             return list(res) if isinstance(res, (list, tuple)) else [res]
         except errors.RPCError as exc:
-            if len(paths) == 1:
-                raise
+            if len(paths) == 1 or isinstance(exc, errors.FloodError):
+                raise  # a flood wait applies to every send: splitting the album would only repeat it
             log.warning("album send failed (%s); sending files individually", short_error(exc))
             out = []
             for i, p in enumerate(paths):
@@ -330,7 +359,8 @@ class Pipeline:
                 )
             except Exception as exc:
                 log.debug("discussion not ready (%d): %s", attempt + 1, short_error(exc))
-                await asyncio.sleep(0.5 * (attempt + 1))
+                if attempt < 4:
+                    await asyncio.sleep(0.5 * (attempt + 1))
 
         # Fallback: locate the forwarded post in COMMENT_CHAT by its unique tag.
         if comment_chat is not None:
@@ -365,12 +395,18 @@ class Pipeline:
         if sender is None:
             log.warning("No comment thread available for %s; comments skipped", tag)
             return 0
-        posted = 0
-        for text in texts:
+        posted = failures = 0
+        for n, text in enumerate(texts):
             try:
                 await self._retry(lambda t=text: sender(t))
                 posted += 1
+                failures = 0
             except Exception as exc:
+                failures += 1
                 log.warning("comment failed: %s", short_error(exc))
-            await asyncio.sleep(settings.COMMENT_DELAY)
+                if isinstance(exc, errors.FloodError) or failures >= 3:
+                    log.warning("giving up on the remaining comments of %s", tag)  # would only repeat the failure
+                    break
+            if n < len(texts) - 1:  # no pointless pause (holding a comment slot) after the last one
+                await asyncio.sleep(settings.COMMENT_DELAY)
         return posted

@@ -15,7 +15,7 @@ from unified_core.config import settings
 from unified_core.database import db
 from unified_core.utils import is_mostly_bengali, short_error
 from unified_services.g4f_chat import G4FChat
-from unified_services.ollama_cloud import CLOUD_URL, OllamaChat
+from unified_services.ollama_cloud import CLOUD_URL, OllamaChat, looks_translated
 from unified_services.openrouter import OpenRouterChat
 
 log = logging.getLogger("zeba.translate")
@@ -29,6 +29,14 @@ _SYSTEM = (
 )
 
 
+def _host(url: str | None) -> str:
+    """Lower-case hostname of a URL; '' for anything unparsable (a typo in .env must not crash translation)."""
+    try:
+        return (urlsplit(url or "").hostname or "").lower()
+    except ValueError:
+        return ""
+
+
 def ollama_settings(force: bool = False) -> tuple[str, str, str] | None:
     """(base_url, api_key, model) when Ollama can be used, else None. `force` ignores TRANSLATE_PROVIDER."""
     provider = (settings.TRANSLATE_PROVIDER or "auto").lower()
@@ -37,7 +45,7 @@ def ollama_settings(force: bool = False) -> tuple[str, str, str] | None:
     if provider == "ollama" or settings.OLLAMA_API_KEY:
         return settings.OLLAMA_BASE_URL or CLOUD_URL, settings.OLLAMA_API_KEY, settings.OLLAMA_MODEL or "auto"
     # an older setup that pointed the OpenAI settings at ollama.com keeps working (and gains auto model choice)
-    host = (urlsplit(settings.OPENAI_BASE_URL).hostname or "").lower()
+    host = _host(settings.OPENAI_BASE_URL)
     if (provider == "auto" or force) and host.endswith("ollama.com") and settings.OPENAI_API_KEY:
         model = settings.OPENAI_MODEL if settings.OPENAI_MODEL not in ("", "auto") else settings.OLLAMA_MODEL
         return CLOUD_URL, settings.OPENAI_API_KEY, model or "auto"
@@ -46,7 +54,7 @@ def ollama_settings(force: bool = False) -> tuple[str, str, str] | None:
 
 def _make_ollama(cfg: tuple[str, str, str]) -> OllamaChat | None:
     base, key, model = cfg
-    is_cloud = (urlsplit(base).hostname or "").lower().endswith("ollama.com")
+    is_cloud = _host(base).endswith("ollama.com")
     if is_cloud and not key:  # local Ollama needs no key, the cloud does
         return None
     return OllamaChat(base, key, model, timeout=max(settings.TRANSLATE_TIMEOUT, 60.0), system=_SYSTEM,
@@ -110,10 +118,14 @@ class Translator:
                 temperature=0.2,
                 messages=[{"role": "system", "content": _SYSTEM}, {"role": "user", "content": text}],
             )
-            return (resp.choices[0].message.content or "").strip()
+            out = (resp.choices[0].message.content or "").strip()
         except Exception as exc:
             log.warning("translation failed: %s", short_error(exc))
             return None
+        if not looks_translated(text, out):  # refusal / chatter must never be posted as the caption
+            log.info("openai did not return a Bangla translation (refusal?) - ignoring the answer")
+            return None
+        return out
 
     def _default_chain(self) -> list[str]:
         """What .env asks for (mode 'auto'): one explicit provider, or every configured one in turn."""
@@ -192,14 +204,17 @@ class Translator:
         if not order:
             lines.append("Active: none - translation is OFF (no key configured, or mode off).")
         for name in order:
-            if name == "ollama":
-                lines.append(await self._get_ollama().describe())
-            elif name == "openrouter":
-                lines.append(await self._get_openrouter().describe())
-            elif name == "openai":
-                lines.append(f"OpenAI-compatible · {settings.OPENAI_BASE_URL} · model {settings.OPENAI_MODEL}")
-            else:
-                lines.append(self._get_g4f().describe())
+            try:
+                if name == "ollama":
+                    lines.append(await self._get_ollama().describe())
+                elif name == "openrouter":
+                    lines.append(await self._get_openrouter().describe())
+                elif name == "openai":
+                    lines.append(f"OpenAI-compatible · {settings.OPENAI_BASE_URL} · model {settings.OPENAI_MODEL}")
+                else:
+                    lines.append(self._get_g4f().describe())
+            except Exception as exc:  # one provider's status call failing must not hide the others
+                lines.append(f"{name}: status unavailable ({short_error(exc, 120)})")
         lines.append("Switch: .ai ollama | .ai openrouter | .ai openai | .ai g4f | .ai off | .ai auto  ·  Test: .ai test")
         return "\n".join(lines)
 
@@ -207,12 +222,14 @@ class Translator:
     async def _run(self, name: str, text: str) -> str | None:
         async with self._sems[name]:
             if name == "ollama":
-                return await self._get_ollama().translate(text)
-            if name == "openrouter":
-                return await self._get_openrouter().translate(text)
-            if name == "g4f":
-                return await self._get_g4f().translate(text)
-            return await self._openai(text)
+                bot = self._get_ollama()
+            elif name == "openrouter":
+                bot = self._get_openrouter()
+            elif name == "g4f":
+                bot = self._get_g4f()
+            else:
+                return await self._openai(text)
+            return await bot.translate(text) if bot is not None else None
 
     async def translate(self, text: str) -> str | None:
         """Return the Bangla translation, or None (disabled / unnecessary / failed)."""
@@ -227,7 +244,11 @@ class Translator:
         if key in self._cache:
             return self._cache[key]
         for name in order:
-            out = await self._run(name, text)
+            try:
+                out = await self._run(name, text)
+            except Exception as exc:  # a broken provider must fall through to the next one, never fail the post
+                log.warning("translation provider %s crashed: %s", name, short_error(exc))
+                continue
             if out:
                 if len(self._cache) > 512:
                     self._cache.clear()
