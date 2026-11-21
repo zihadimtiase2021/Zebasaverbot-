@@ -65,6 +65,30 @@ contacts are skipped; files over your upload limit are skipped with a notificati
 the reverse route (A→B plus B→A) is refused so two chats can't copy each other forever. `FWD_ENABLED=false` switches it off,
 `FWD_DELAY` (default 0.7 s) is the pause between two copies, `FWD_ID_PREFIX` changes `ZF`.
 
+### Find a product + private notes (control bot only)
+Every copied message (= "product") gets a hidden record that **only admins see, in the control bot chat** - the channel only
+ever sees the copy with its serial number. Saved automatically: source chat, the **original caption** (before links / ban words were
+cut out), number of files, which account copied it, time, links to the source message and the copy.
+
+| Command | What it does |
+|---|---|
+| `/find 42` (or `/find ZF-000042`) | full details of that product, with its private note |
+| `/find some words` | full details of every match (serial, source name, original caption, note) - the 5 newest in full, the rest as a list |
+| `/addnote 42 price 15$` | adds a private note (a new line when the product already has one; max 1500 characters) |
+| `/removenote 42` | removes the note of that product |
+| `/defnote` | lists every source group / channel with its **default note** |
+| `/defnote 2 Supplier Rahim, COD` | sets the default note of source no. 2 - it goes on every **new** product copied from there |
+| `/defnote 2 -` | deletes that default note (products already made keep theirs) |
+
+Default notes are per **source** group / channel (the place the product comes from), so every source can have its own.
+
+**Backup in Saved Messages:** serial numbers with their source / copy ids, details, notes and default notes are also kept as ONE file
+(`zeba_fwd_backup.json.gz`, caption `#zeba_fwd_backup`) in the Saved Messages of the main account. It is rewritten ~20 s after a note
+changes (and at most every ~5 min while copies are being made, and on shutdown); only the newest file stays. At start-up whatever the
+database is missing is put back (nothing that exists is changed), so a Render restart does not lose them. An empty database never
+overwrites the backup. **Do not delete that message.** Copies without a note you wrote are forgotten after 90 days; a copy with your own
+note is kept for ever.
+
 ## Quick start (one command)
 ```bash
 python3 run.py          # or ./run.sh  (Windows: run.bat)

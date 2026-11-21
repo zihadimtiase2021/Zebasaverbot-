@@ -34,6 +34,9 @@ HELP_TEXT = (
     "<code>/logout 2</code> · <code>/resume &lt;key&gt;</code> log back in with the session key you got at login\n"
     "• <b>Forward with several accounts:</b> 🔁 Forward → <b>👤 Account</b> picks whose routes you manage; when you add a route and "
     "more than one account is in both chats, you choose which account does the copying\n"
+    "• <b>Find a product:</b> <code>/find 42</code> (serial) or <code>/find words</code> — full details + private note · "
+    "<code>/addnote 42 text</code> · <code>/removenote 42</code> · <code>/defnote</code> default note per source group/channel — "
+    "visible only here, never in the channel; backed up in Saved Messages\n"
     "• Web panel: <code>/admin</code> on your service URL (same switches, no redeploy)\n"
     "• Unfinished batches continue automatically after a restart"
 )
@@ -73,6 +76,8 @@ def register_control_bot(app: App, accounts=None) -> None:
 
     from unified_services.bot_menus import register_bot_menus
     register_bot_menus(app, bot, is_admin, accounts)
+    from unified_services.find_cmds import register_find_commands
+    register_find_commands(bot, is_admin, accounts, app)
     if accounts is not None:
         from unified_services.account_bot import register_account_commands
         register_account_commands(app, accounts, is_admin)

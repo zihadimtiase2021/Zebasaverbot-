@@ -9,6 +9,8 @@ import aiosqlite
 
 from unified_core.config import settings
 
+NOTE_MAX = 1500  # characters of one admin note (a Telegram message holds 4096)
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
@@ -56,7 +58,19 @@ CREATE TABLE IF NOT EXISTS fwd_log (
     src_msg INTEGER NOT NULL,
     dst_chat INTEGER NOT NULL,
     dst_msg INTEGER,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    src_name TEXT,
+    caption TEXT,
+    media INTEGER,
+    account INTEGER,
+    note TEXT,
+    note_auto INTEGER NOT NULL DEFAULT 0
+);
+-- Default note (admin only) put on every NEW copy that comes from this source group / channel
+CREATE TABLE IF NOT EXISTS fwd_defaults (
+    src_chat INTEGER PRIMARY KEY,
+    src_name TEXT,
+    note TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_fwd_src ON fwd_log(src_chat, src_msg, dst_chat);
 -- Extra userbot accounts logged in from the control bot (the session is the "key"; removed again on logout)
@@ -83,6 +97,15 @@ class Database:
     def __init__(self) -> None:
         self._conn: aiosqlite.Connection | None = None
 
+    def _changed(self, delay: float) -> None:
+        """Tell the Saved Messages backup that product details changed (it writes them soon, debounced)."""
+        cb = getattr(self, "on_change", None)
+        if cb is not None:
+            try:
+                cb(delay)
+            except Exception:  # a backup problem must never break forwarding
+                pass
+
     @property
     def conn(self) -> aiosqlite.Connection:
         if self._conn is None:
@@ -105,6 +128,13 @@ class Database:
             await self._conn.execute("ALTER TABLE batches ADD COLUMN dest INTEGER")
         if "owner" not in cols:  # which Telegram account started the batch (NULL = the primary account)
             await self._conn.execute("ALTER TABLE batches ADD COLUMN owner INTEGER")
+        async with self._conn.execute("PRAGMA table_info(fwd_log)") as cur:  # hidden product details (admin only)
+            fcols = {r[1] for r in await cur.fetchall()}
+        for col, typ in (("src_name", "TEXT"), ("caption", "TEXT"), ("media", "INTEGER"),
+                         ("account", "INTEGER"), ("note", "TEXT"),
+                         ("note_auto", "INTEGER NOT NULL DEFAULT 0")):
+            if col not in fcols:
+                await self._conn.execute(f"ALTER TABLE fwd_log ADD COLUMN {col} {typ}")
         await self._conn.commit()
 
     async def close(self) -> None:
@@ -309,6 +339,94 @@ class Database:
         await self.conn.execute("UPDATE fwd_log SET dst_msg = ? WHERE uid = ?", (dst_msg, uid))
         await self.conn.commit()
 
+    async def fwd_set_details(self, uid: str, src_name: str, caption: str, media: int, account: int,
+                              note: str | None = None) -> None:
+        """Hidden details of a copy (never posted to the channel): where it came from, the ORIGINAL caption, ...
+        `note` = the default note of the source (kept only when the copy has no note yet)."""
+        await self.conn.execute(
+            "UPDATE fwd_log SET src_name = :src, caption = :cap, media = :media, account = :acc, "
+            "note_auto = CASE WHEN (note IS NULL OR note = '') AND :note IS NOT NULL THEN 1 ELSE note_auto END, "
+            "note = COALESCE(NULLIF(note, ''), :note) WHERE uid = :uid",
+            {"src": src_name, "cap": (caption or "")[:3500], "media": media, "acc": account,
+             "note": (note or "").strip()[:NOTE_MAX] or None, "uid": uid})
+        await self.conn.commit()
+        self._changed(300.0)
+
+    async def fwd_set_note(self, uid: str, note: str | None) -> bool:
+        """Admin note of a copy ('' / None clears it). False when the serial number is unknown."""
+        cur = await self.conn.execute("UPDATE fwd_log SET note = ?, note_auto = 0 WHERE uid = ? AND dst_msg IS NOT NULL",
+                                      ((note or "").strip()[:NOTE_MAX] or None, uid))
+        await self.conn.commit()
+        self._changed(20.0)
+        return cur.rowcount > 0
+
+    # ---------- default note per source + export / import (Saved Messages backup) ----------
+    async def fwd_default_get(self, src_chat: int) -> str | None:
+        async with self.conn.execute("SELECT note FROM fwd_defaults WHERE src_chat = ?", (src_chat,)) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else None
+
+    async def fwd_default_set(self, src_chat: int, src_name: str, note: str | None) -> None:
+        """Default note of a source group / channel ('' / None deletes it)."""
+        note = (note or "").strip()[:NOTE_MAX]
+        if note:
+            await self.conn.execute(
+                "INSERT INTO fwd_defaults (src_chat, src_name, note) VALUES (?, ?, ?) "
+                "ON CONFLICT(src_chat) DO UPDATE SET src_name = excluded.src_name, note = excluded.note",
+                (src_chat, src_name, note))
+        else:
+            await self.conn.execute("DELETE FROM fwd_defaults WHERE src_chat = ?", (src_chat,))
+        await self.conn.commit()
+        self._changed(20.0)
+
+    async def fwd_defaults_all(self) -> list[dict]:
+        async with self.conn.execute("SELECT * FROM fwd_defaults ORDER BY src_chat") as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def fwd_export(self) -> dict:
+        """Everything worth keeping when the database is lost: finished copies (serial, ids, details, note) + defaults."""
+        async with self.conn.execute("SELECT * FROM fwd_log WHERE dst_msg IS NOT NULL ORDER BY created_at, uid") as cur:
+            rows = [dict(r) for r in await cur.fetchall()]
+        return {"v": 1, "rows": rows, "defaults": await self.fwd_defaults_all()}
+
+    async def fwd_import(self, data: dict, keep_days: int = 90) -> int:
+        """Put an export back. Only what is MISSING is added (nothing that exists is changed); copies older than
+        the prune limit are skipped unless they carry a note. Returns the number of rows added."""
+        cols = ("uid", "src_chat", "src_msg", "dst_chat", "dst_msg", "created_at",
+                "src_name", "caption", "media", "account", "note", "note_auto")
+        cutoff = int(time.time()) - keep_days * 86400
+        added = 0
+        for r in data.get("rows", []):
+            try:
+                own_note = bool((r.get("note") or "").strip()) and not r.get("note_auto")
+                if int(r["created_at"]) < cutoff and not own_note:
+                    continue
+                cur = await self.conn.execute(
+                    f"INSERT OR IGNORE INTO fwd_log ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                    tuple((r.get(c) or 0) if c == "note_auto" else r.get(c) for c in cols))
+                added += max(cur.rowcount, 0)
+            except (KeyError, TypeError, ValueError):
+                continue
+        for d in data.get("defaults", []):
+            try:
+                await self.conn.execute(
+                    "INSERT OR IGNORE INTO fwd_defaults (src_chat, src_name, note) VALUES (?, ?, ?)",
+                    (int(d["src_chat"]), d.get("src_name"), str(d["note"])[:NOTE_MAX]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        await self.conn.commit()
+        return added
+
+    async def fwd_search(self, text: str, limit: int = 10) -> list[dict]:
+        """Copies whose serial number, source name, original caption or note contain `text` (newest first)."""
+        like = "%" + text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        async with self.conn.execute(
+            "SELECT * FROM fwd_log WHERE dst_msg IS NOT NULL AND (uid LIKE ? ESCAPE '\\' OR src_name LIKE ? ESCAPE '\\' "
+            "OR caption LIKE ? ESCAPE '\\' OR note LIKE ? ESCAPE '\\') ORDER BY created_at DESC, uid DESC LIMIT ?",
+            (like, like, like, like, limit),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
     async def fwd_drop(self, uid: str) -> None:
         """Forget a reserved id whose copy failed (the message may be copied again later)."""
         await self.conn.execute("DELETE FROM fwd_log WHERE uid = ? AND dst_msg IS NULL", (uid,))
@@ -327,7 +445,9 @@ class Database:
             return await cur.fetchone() is not None
 
     async def fwd_prune(self, days: int = 90) -> None:
-        await self.conn.execute("DELETE FROM fwd_log WHERE created_at < ?", (int(time.time()) - days * 86400,))
+        await self.conn.execute(  # a copy with a note the admin wrote is never pruned (a default note does not count)
+            "DELETE FROM fwd_log WHERE created_at < ? AND (note IS NULL OR note = '' OR note_auto = 1)",
+            (int(time.time()) - days * 86400,))
         await self.conn.commit()
 
     async def job_stats(self) -> dict:

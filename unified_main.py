@@ -32,6 +32,7 @@ from unified_services.keepalive import KeepAlive  # noqa: E402
 from unified_services.webhook import WebhookServer  # noqa: E402
 from unified_services.runtime_config import RuntimeConfig  # noqa: E402
 from unified_services.forwarder import Forwarder  # noqa: E402
+from unified_services.fwd_backup import FwdBackup  # noqa: E402
 from unified_services.admin_panel import AdminPanel  # noqa: E402
 from unified_services.accounts import AccountManager  # noqa: E402
 from unified_services.userbot_handlers import on_job_result, register_userbot_handlers, resume_batches  # noqa: E402
@@ -92,6 +93,7 @@ async def main() -> int:
     web: WebhookServer | None = None
     keepalive: KeepAlive | None = None
     forwarder: Forwarder | None = None
+    fwd_backup: FwdBackup | None = None
     accounts: AccountManager | None = None
 
     try:
@@ -160,6 +162,10 @@ async def main() -> int:
 
         register_userbot_handlers(app)
 
+        # product details / notes survive a wiped database (Render free): kept as a file in Saved Messages
+        fwd_backup = FwdBackup(userbot, db)
+        await fwd_backup.restore()
+        db.on_change = fwd_backup.touch
         forwarder = Forwarder(userbot, pipeline, me_id=me.id, store=runtime)
         await forwarder.load()      # routes saved in Saved Messages (survive Render restarts)
         forwarder.register()
@@ -238,6 +244,8 @@ async def main() -> int:
             await accounts.stop_all()
         if forwarder is not None:
             await forwarder.stop(grace=20)
+        if fwd_backup is not None:
+            await fwd_backup.stop()   # the copies are finished: write the last details while the userbot is connected
         if queue is not None:
             await queue.stop(grace=30)
         if pipeline is not None:

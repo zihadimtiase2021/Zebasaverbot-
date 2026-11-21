@@ -576,6 +576,11 @@ class Forwarder:
         for s in sent:
             self._sent.append((dst, s.id))
         await db.fwd_set_dst(uid, sent[0].id)
+        try:  # hidden details for /find (admin only, never posted to the channel)
+            default = await db.fwd_default_get(route["src"])   # /defnote of this source group / channel
+            await db.fwd_set_details(uid, route.get("src_name", ""), raw or "", len(specs), self.me_id, default)
+        except Exception as exc:
+            log.debug("could not save the details of %s: %s", uid, exc)
         log.info("copied %s:%s -> %s as %s", route["src"], first_msg.id, dst, uid)
 
     async def _send(self, dst, uid: str, raw, ents, specs: list[FileSpec], preview: bool) -> list:
