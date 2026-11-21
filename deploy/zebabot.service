@@ -1,0 +1,20 @@
+# 1) Run once in a terminal so the wizard can ask its questions:   python3 run.py --setup-only
+# 2) sudo cp deploy/zebabot.service /etc/systemd/system/ && sudo systemctl enable --now zebabot
+[Unit]
+Description=Zeba Saver Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zeba
+WorkingDirectory=/opt/zebasaverbot
+ExecStart=/opt/zebasaverbot/.venv/bin/python unified_main.py
+Restart=always
+RestartSec=5
+RestartPreventExitStatus=2
+TimeoutStopSec=90
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

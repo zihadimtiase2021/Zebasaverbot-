@@ -1,0 +1,16 @@
+.env
+data/*
+!data/.gitkeep
+*.session
+*.session-journal
+cookies.txt
+*.db
+*.db-wal
+*.db-shm
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.deps-stamp
+.env.tmp

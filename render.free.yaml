@@ -1,0 +1,42 @@
+# FREE Render deployment (sleeps without traffic, no persistent disk, 512 MB RAM / 0.1 CPU). See RENDER_DEPLOY.md.
+# Use it as the Blueprint file (or just follow the manual steps in RENDER_DEPLOY.md - same settings).
+services:
+  - type: web
+    name: zebasaverbot
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: CONTROL_BOT_TOKEN
+        sync: false
+      - key: OLLAMA_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: X_ACCOUNTS
+        sync: false
+      - key: COOKIES_B64
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: RENDER_API_KEY
+        sync: false
+      - key: ZEBA_SETUP_COMPLETE
+        value: "1"
+      # tuned for 512 MB RAM / 0.1 CPU
+      - key: MAX_CONCURRENCY
+        value: "1"
+      - key: UPLOAD_CONCURRENCY
+        value: "1"
+      - key: COMMENT_CONCURRENCY
+        value: "1"
+      - key: MAX_VIDEO_HEIGHT
+        value: "720"
+      - key: KEEPALIVE_ENABLED
+        value: "true"

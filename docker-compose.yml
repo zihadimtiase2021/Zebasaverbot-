@@ -1,0 +1,20 @@
+# First start (asks for everything, then runs):   docker compose run --rm zebabot
+# After that, in the background:                  docker compose up -d --build
+services:
+  zebabot:
+    build: .
+    container_name: zebasaverbot
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    volumes:
+      - zeba-data:/data       # settings (.env), session, databases, cookies, logs
+    stop_grace_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  zeba-data:
