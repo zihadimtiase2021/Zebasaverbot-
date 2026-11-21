@@ -34,11 +34,18 @@ class Bot:
 
 
 class Ev:
-    def __init__(self, text, uid=1):
+    def __init__(self, text, uid=1, client=None):
         self.text, self.sender_id, self.out, self.pattern_match = text, uid, [], None
+        self.kw, self.client, self.chat_id, self.deleted = [], client, 42, 0
 
     async def respond(self, text, **kw):
         self.out.append(text)
+        self.kw.append(kw)
+        ev = self
+
+        async def delete():
+            ev.deleted += 1
+        return types.SimpleNamespace(id=len(self.out), delete=delete)
 
 
 def run(coro):
@@ -54,21 +61,36 @@ async def fill():
         await db.fwd_set_details(uid, src, cap, 3, 10)
 
 
-def make_bot(routes=()):
+def make_bot(routes=(), userbot=None, client=None):
     bot = Bot()
     accounts = types.SimpleNamespace(instances={}, primary_username="boss", primary_name="Boss")
-    app = types.SimpleNamespace(me_id=10, forwarder=types.SimpleNamespace(routes=list(routes)))
+    fw = types.SimpleNamespace(routes=list(routes), userbot=userbot, me_id=10)
+    app = types.SimpleNamespace(me_id=10, forwarder=fw)
     find_cmds.register_find_commands(bot, lambda uid: uid == 1, accounts, app)
 
-    async def call(text, uid=1):
-        ev = Ev(text, uid)
+    async def call(text, uid=1, full=False):
+        ev = Ev(text, uid, client)
         for pat, fn in bot.h:
+            if isinstance(pat, bytes):          # callback-query handlers are called with call_cb()
+                continue
             m = re.match(pat, text)
             if m:
                 ev.pattern_match = m
                 await fn(ev)
-                return ev.out
+                return ev if full else ev.out
         raise AssertionError("no handler for " + text)
+
+    async def call_cb(data: bytes, uid=1):
+        ev = Ev("", uid, client)
+        ev.answer = lambda *a, **k: asyncio.sleep(0)
+        for pat, fn in bot.h:
+            m = re.match(pat, data) if isinstance(pat, bytes) else None
+            if m:
+                ev.pattern_match = m
+                await fn(ev)
+                return ev
+        raise AssertionError("no callback handler for %r" % data)
+    call.cb = call_cb
     return call
 
 
@@ -120,17 +142,18 @@ def test_find_addnote_removenote_admin_only():
             assert await call("/find 1", uid=2) == [] and await call("/addnote 1 x", uid=2) == []   # not an admin
             card = (await call("/find 1"))[0]
             assert "ZF-000001" in card and "Shop A" in card and "Red dress 50% off" in card and "@boss" in card
-            assert "https://t.me/c/1234567/101" in card and "https://t.me/c/7654321/501" in card and "(none)" in card
+            assert "https://t.me/c/1234567/101" in card and "https://t.me/c/7654321/501" in card and "no note" in card
+            assert "Files" not in card and "Original caption" not in card          # minimal card: no "Files: 3" line
             assert "added" in (await call("/addnote 1 price 15$"))[0]
             assert "added" in (await call("/addnote ZF-000001 supplier Rahim"))[0]      # second note = new line
             assert "price 15$\nsupplier Rahim" in (await call("/find 1"))[0]
             out = await call("/find rahim")                                              # search = full details
-            assert out[0].startswith("🔎") and "Original caption" in out[1] and "supplier Rahim" in out[1]
+            assert len(out) == 1 and "ZF-000001" in out[0] and "supplier Rahim" in out[0]      # one match = the card
             assert "No copy" in (await call("/find 77"))[0] and "No copy" in (await call("/addnote 77 x"))[0]
             assert "Nothing found" in (await call("/find zzz"))[0]
             assert "Too long" in (await call("/addnote 1 " + "x" * 1600))[0]
             assert "removed" in (await call("/removenote 1"))[0]
-            assert "(none)" in (await call("/find 1"))[0] and "no note" in (await call("/removenote 1"))[0]
+            assert "no note" in (await call("/find 1"))[0] and "no note" in (await call("/removenote 1"))[0]
             assert "Usage" in (await call("/addnote"))[0] and "Usage" in (await call("/removenote"))[0]
         finally:
             await db.close()
@@ -231,3 +254,131 @@ def test_backup_is_written_after_a_change():
             db.on_change = None
             await db.close()
     run(go())
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# the database forgot the serial (Render restart / 90 day clean-up): /find searches the destination chat itself
+class FakeMsg(types.SimpleNamespace):
+    pass
+
+
+def tg_msg(mid, text="", gid=None, media=False, reply=None):
+    return FakeMsg(id=mid, raw_text=text, grouped_id=gid, media=object() if media else None,
+                   photo=object() if media else None, document=None, reply_to_msg_id=reply,
+                   date=types.SimpleNamespace(timestamp=lambda: 1_700_000_000), file=types.SimpleNamespace(size=10),
+                   video=None, voice=None, video_note=None, gif=None, audio=None)
+
+
+class FakeUserbot:
+    """A destination chat with one 7 file album whose first file carries the caption + serial, and a text post."""
+
+    def __init__(self, tmp_path=None):
+        album = [tg_msg(1870, "\u2063Roza Non professional. 1 hr 08k\n\nZF-000020", gid=77, media=True)]
+        album += [tg_msg(1870 + i, "", gid=77, media=True) for i in range(1, 7)]
+        self.chat = {m.id: m for m in album}
+        self.chat[1900] = tg_msg(1900, "Just text ZF-000200")
+        self.searches, self.downloads = [], []
+
+    async def iter_messages(self, chat, search=None, limit=None):
+        assert chat == DST
+        self.searches.append(search)
+        for m in sorted(self.chat.values(), key=lambda x: -x.id):
+            if search is None or search.lower() in m.raw_text.lower():
+                yield m
+
+    async def get_messages(self, chat, ids=None):
+        if isinstance(ids, list):
+            return [self.chat.get(i) for i in ids]
+        return self.chat.get(ids)
+
+    async def download_media(self, m, file=None):
+        path = f"{file}{m.id}.jpg"
+        open(path, "wb").write(b"x")
+        self.downloads.append(m.id)
+        return path
+
+
+class FakeClient:
+    def __init__(self):
+        self.sent = []
+
+    async def send_file(self, chat, file, **kw):
+        self.sent.append((chat, file, kw))
+        return [types.SimpleNamespace(id=5000 + i) for i in range(len(file) if isinstance(file, list) else 1)]
+
+
+def test_find_restores_a_forgotten_serial_from_the_destination_and_sends_the_album():
+    async def go():
+        await db.connect(":memory:")                                   # EMPTY database: it knows nothing
+        try:
+            ub, client = FakeUserbot(), FakeClient()
+            call = make_bot([{"src": SRC, "dst": DST, "src_name": "Shop", "dst_name": "Main"}], ub, client)
+            ev = await call("/find 20", full=True)
+            assert len(client.sent) == 1                               # ONE message: the album, card as its caption
+            chat, files, kw = client.sent[0]
+            assert chat == 42 and isinstance(files, list) and len(files) == 7
+            assert "ZF-000020" in kw["caption"] and "Roza Non professional" in kw["caption"] and "Files" not in kw["caption"]
+            assert "https://t.me/c/7654321/1870" in kw["caption"] and len(kw["caption"]) <= 1024
+            assert sorted(ub.downloads) == list(range(1870, 1877)) and ev.deleted >= 1   # status message removed
+            assert ub.searches[0] == "ZF-000020"                       # the serial itself was searched
+            row = await db.fwd_get("ZF-000020")                        # and the product is back in the database
+            assert row["dst_chat"] == DST and row["dst_msg"] == 1870 and row["media"] == 7
+            assert "Roza" in row["caption"] and "ZF-000020" not in row["caption"]
+            # now a note works on it, and a second /find does not search the chat again
+            assert "added" in (await call("/addnote 20 price 12k"))[0]
+            before = len(ub.searches)
+            await call("/find 20")
+            assert len(ub.searches) == before and "price 12k" in client.sent[-1][2]["caption"]
+            # ZF-000200 is a different serial: ZF-000020 must not match it
+            assert "No copy" in (await call("/find 21"))[-1]       # (the first message is the "Searching…" status)
+            # a serial that is nowhere: a clear message, nothing stored
+            assert await db.fwd_get("ZF-000021") is None
+        finally:
+            await db.close()
+    run(go())
+
+
+def test_addnote_on_a_forgotten_serial_and_text_search_in_the_destination():
+    async def go():
+        await db.connect(":memory:")
+        try:
+            ub, client = FakeUserbot(), FakeClient()
+            call = make_bot([{"src": SRC, "dst": DST}], ub, client)
+            assert "added" in (await call("/addnote ZF-000020 supplier Rahim"))[0]
+            assert (await db.fwd_get("ZF-000020"))["note"] == "supplier Rahim"
+            await db.close()
+            await db.connect(":memory:")
+            out = await call("/find roza")                              # words: not in db -> destination search
+            assert len(client.sent) == 1 and "ZF-000020" in client.sent[0][2]["caption"]
+        finally:
+            await db.close()
+    run(go())
+
+
+def test_text_search_with_several_matches_is_a_list_with_buttons():
+    async def go():
+        await fill()
+        try:
+            call = make_bot()
+            ev = await call("/find e", full=True)                        # both products contain an "e"
+            assert len(ev.out) == 1 and "ZF-000001" in ev.out[0] and "ZF-000002" in ev.out[0]
+            rows = ev.kw[0]["buttons"]
+            assert [b[0] for r in rows for b in r] == ["ZF-000002", "ZF-000001"]           # newest first
+            assert [b[1] for r in rows for b in r] == [b"fd:2", b"fd:1"]
+            card = (await call.cb(b"fd:2")).out[0]                       # tapping a button opens the product
+            assert "ZF-000002" in card and "Blue shirt_xl" in card
+            assert (await call.cb(b"fd:2", uid=9)).out == []             # not an admin: nothing
+        finally:
+            await db.close()
+    run(go())
+
+
+def test_card_is_minimal_and_keeps_a_caption_within_telegram_limits():
+    row = {"uid": "ZF-000246", "created_at": 1_700_000_000, "src_chat": -1002869880872, "src_msg": 1280,
+           "src_name": "Realservicedhakabd", "dst_chat": -1002940625991, "dst_msg": 1876, "media": 7,
+           "caption": "Name: Roza " * 200, "note": "n" * 1500}
+    full, short = find_cmds.make_card(row, "@lovebirds25"), find_cmds.make_card(row, "@lovebirds25", compact=True)
+    assert "Files" not in full and "7" not in full.split("\n")[0] and "@lovebirds25" in full
+    assert "Source" in full and "Copy" in full and "<blockquote>" in full
+    plain = re.sub(r"<[^>]+>", "", short)
+    assert len(plain) <= 1024

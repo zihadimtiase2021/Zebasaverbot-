@@ -427,6 +427,24 @@ class Database:
         ) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
+    async def fwd_adopt(self, uid: str, dst_chat: int, dst_msg: int, created_at: int, caption: str,
+                        media: int | None, account: int = 0) -> bool:
+        """Put back a copy that was found in its destination chat (the database had forgotten it).
+        The source is unknown then (src_chat = 0). Never changes an existing row."""
+        cur = await self.conn.execute(
+            "INSERT OR IGNORE INTO fwd_log (uid, src_chat, src_msg, dst_chat, dst_msg, created_at, src_name, caption, "
+            "media, account) VALUES (?, 0, 0, ?, ?, ?, '', ?, ?, ?)",
+            (uid, dst_chat, dst_msg, int(created_at), (caption or "")[:3500], media, account))
+        await self.conn.commit()
+        self._changed(300.0)
+        return cur.rowcount > 0
+
+    async def fwd_dst_chats(self) -> list[int]:
+        """Every destination chat that ever received a copy (newest first)."""
+        async with self.conn.execute(
+                "SELECT dst_chat FROM fwd_log GROUP BY dst_chat ORDER BY MAX(created_at) DESC") as cur:
+            return [int(r[0]) for r in await cur.fetchall()]
+
     async def fwd_drop(self, uid: str) -> None:
         """Forget a reserved id whose copy failed (the message may be copied again later)."""
         await self.conn.execute("DELETE FROM fwd_log WHERE uid = ? AND dst_msg IS NULL", (uid,))
