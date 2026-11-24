@@ -40,7 +40,7 @@ from telethon.tl.types import MessageMediaWebPage
 from unified_core.cleanup import safe_rmtree
 from unified_core.config import settings
 from unified_core.database import db
-from unified_core.tg import parse_chat_ref, resolve_peer
+from unified_core.tg import forum_topic_of, parse_chat_ref, parse_chat_topic, resolve_peer
 from unified_core.utils import NOTIFY_MARK, esc, short_error
 from unified_services import banwords, watermark
 from unified_services.fwd_ledger import Ledger, route_key
@@ -64,6 +64,18 @@ class TooLarge(Exception):
 
 
 # ------------------------------------------------------------------ pure helpers
+def _topic_id(v) -> int:
+    try:
+        return max(0, int(v or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def rkey(r: dict) -> str:
+    """Ledger / job key of a route (or a job record): chats plus their topics, if any."""
+    return route_key(r["src"], r["dst"], _topic_id(r.get("src_topic")), _topic_id(r.get("dst_topic")))
+
+
 def route_defaults(r: dict) -> dict:
     """A saved route with every field present. Routes saved by older versions simply lack the new fields:
     Watch ON (`active`), no route ban words (`bans`, combined with the global list), serial numbers ON on the
@@ -75,6 +87,8 @@ def route_defaults(r: dict) -> dict:
         start = 0
     return {"src": int(r["src"]), "dst": int(r["dst"]), "src_name": str(r.get("src_name", "")),
             "dst_name": str(r.get("dst_name", "")), "active": bool(r.get("active", True)),
+            "src_topic": _topic_id(r.get("src_topic")),     # 0 = the whole source chat, else only this forum topic
+            "dst_topic": _topic_id(r.get("dst_topic")),     # 0 = post in the chat itself, else into this forum topic
             "bans": [str(b) for b in bans if str(b).strip()] if isinstance(bans, list) else [],
             "ban_mode": "only" if r.get("ban_mode") == "only" else "add",   # add = on top of the global list
             "serial_on": bool(r.get("serial_on", True)),
@@ -297,13 +311,20 @@ class Forwarder:
             return False
         return bool(getattr(msg, "raw_text", "") or _media_kind(msg))
 
+    @staticmethod
+    def _topic_ok(route: dict, msg) -> bool:
+        """True when the route reads the whole source chat, or `msg` was written in the route's source topic
+        (a message outside any topic belongs to the General topic = 1)."""
+        want = _topic_id(route.get("src_topic"))
+        return not want or (forum_topic_of(msg) or 1) == want
+
     def _wanted(self, chat_id: int, msg) -> list[dict]:
         if not settings.FWD_ENABLED or not self.watch:   # Watch OFF: new messages are left alone (Forward all still works)
             return []
         routes = self._routes_for(chat_id)
         if not routes or not self._copyable(chat_id, msg):
             return []
-        return routes
+        return [r for r in routes if self._topic_ok(r, msg)]   # a route can be limited to one topic of the source
 
     async def _on_message(self, event) -> None:
         try:
@@ -365,8 +386,8 @@ class Forwarder:
                     job["pending"] -= 1
                 self._q.task_done()
 
-    def _mark(self, src: int, dst: int, msgs) -> None:
-        key = route_key(src, dst)
+    def _mark(self, route: dict, msgs) -> None:
+        key = rkey(route)
         for m in msgs:
             self.ledger.add(key, m.id)
 
@@ -387,11 +408,12 @@ class Forwarder:
         ids = [m.id for m in msgs]
         todo = []
         for r in item.routes:
-            key = route_key(item.src, r["dst"])
+            key = rkey(r)
             if self.ledger.has_all(key, ids):
                 continue
-            if await db.fwd_seen(item.src, msgs[0].id, r["dst"]):  # copied before the ledger existed
-                self._mark(item.src, r["dst"], msgs)
+            # copied before the ledger existed (that old log knows no topics, so topic routes skip it)
+            if not (r.get("src_topic") or r.get("dst_topic")) and await db.fwd_seen(item.src, msgs[0].id, r["dst"]):
+                self._mark(r, msgs)
                 continue
             todo.append(r)
         if not todo:
@@ -407,10 +429,10 @@ class Forwarder:
                 # every route cuts its own ban words (global list + the route's list, or only the route's list)
                 r_raw, r_ents = banwords.strip_banned(raw, ents, self.effective_bans(route))
                 if not specs and not r_raw:          # nothing left to send there: do not look at it again
-                    self._mark(item.src, route["dst"], msgs)
+                    self._mark(route, msgs)
                     continue
                 await self._deliver(route, msgs[0], r_raw, r_ents, specs, preview)
-                self._mark(item.src, route["dst"], msgs)
+                self._mark(route, msgs)
                 delivered += 1
                 await asyncio.sleep(settings.FWD_DELAY)
             if not delivered:
@@ -476,8 +498,15 @@ class Forwarder:
         return spec
 
     # ---------------------------------------------------------------- Forward all (history of the source)
+    @staticmethod
+    def _read_kw(route: dict) -> dict:
+        """Read only the source topic: Telegram lists a topic as the replies of its first message. The General topic
+        (1) has no such list - it is read with everything else and filtered by `_topic_ok`."""
+        t = _topic_id(route.get("src_topic"))
+        return {"reply_to": t} if t > 1 else {}
+
     def _job_for(self, route: dict) -> dict | None:
-        return self.jobs.get(route_key(route["src"], route["dst"]))
+        return self.jobs.get(rkey(route))
 
     def start_all(self, routes: list[dict]) -> str:
         """Copy everything of each source that is not in the ledger yet (oldest first). Returns the answer text."""
@@ -493,15 +522,16 @@ class Forwarder:
                 running.append(r)
                 continue
             job = {"state": "running", "src": r["src"], "dst": r["dst"], "src_name": r["src_name"],
+                   "src_topic": r.get("src_topic", 0), "dst_topic": r.get("dst_topic", 0),
                    "dst_name": r["dst_name"], "stop": False, "pending": 0, "scanned": 0, "sent": 0, "seen": 0,
                    "skipped": 0, "empty": 0, "stopped": 0, "failed": 0, "failed_ids": [], "streak": 0,
                    "total": 0, "note": "", "started": time.time(), "task": None, "last_id": 0, "mixed": False}
-            self.jobs[route_key(r["src"], r["dst"])] = job
+            self.jobs[rkey(r)] = job
             new_jobs.append((r, job))
             started.append(r)
         if new_jobs:                              # saved first: a redeploy right now still resumes these routes
             for r, _job in new_jobs:
-                k = route_key(r["src"], r["dst"])
+                k = rkey(r)
                 if k not in self.resume_keys:
                     self.resume_keys.append(k)
             self._spawn(self._persist())
@@ -577,14 +607,14 @@ class Forwarder:
         if int(start) < 1:
             raise ValueError("the start number must be 1 or higher")
         route["serial_start"] = int(start)
-        self.ledger.restart_route_serial(route_key(route["src"], route["dst"]))
+        self.ledger.restart_route_serial(rkey(route))
         await self._persist()
         return f"🔢 This route now counts from <b>{new_uid(serial=int(start))}</b>."
 
     async def reset_serial(self, route: dict) -> str:
         """Back to the global counter (the route's own counter is dropped)."""
         route["serial_start"] = 0
-        self.ledger.restart_route_serial(route_key(route["src"], route["dst"]))
+        self.ledger.restart_route_serial(rkey(route))
         await self._persist()
         return "🔢 This route uses the global counter again."
 
@@ -598,7 +628,7 @@ class Forwarder:
             names = ", ".join(f"{r['src_name']} ➜ {r['dst_name']}" for r in busy)
             raise ValueError(f"Forward all is still running for {names} - stop it first")
         for r in routes:
-            key = route_key(r["src"], r["dst"])
+            key = rkey(r)
             self.ledger.forget(key)
             self.jobs.pop(key, None)
             if key in self.resume_keys:
@@ -614,10 +644,14 @@ class Forwarder:
         return text
 
     async def _queue_group(self, job: dict, route: dict, msgs: list) -> bool:
-        key = route_key(route["src"], route["dst"])
+        key = rkey(route)
         ids = [m.id for m in msgs]
         if self.ledger.has_all(key, ids):
             job["seen"] += 1
+            return False
+        if not self._topic_ok(route, msgs[0]):     # another topic of the source: not this route's business
+            for i in ids:
+                self.ledger.add(key, i)
             return False
         if not any(self._copyable(route["src"], m) for m in msgs):
             for i in ids:                      # service message / empty: resolved, never looked at again
@@ -633,16 +667,18 @@ class Forwarder:
         return True                            # queued (Mixing counts only these toward its 5 per turn)
 
     async def _backfill(self, route: dict, job: dict) -> None:
-        key = route_key(route["src"], route["dst"])
+        key = rkey(route)
         floor = self.ledger.resume_from(key)
         last = floor
         group: list = []
         try:
             try:
-                job["total"] = int((await self.userbot.get_messages(route["src"], limit=0)).total or 0)
+                job["total"] = int((await self.userbot.get_messages(route["src"], limit=0,
+                                                                    **self._read_kw(route))).total or 0)
             except Exception as exc:
                 log.debug("could not count the messages of %s: %s", route["src"], exc)
-            async for m in self.userbot.iter_messages(route["src"], reverse=True, min_id=floor):
+            async for m in self.userbot.iter_messages(route["src"], reverse=True, min_id=floor,
+                                                      **self._read_kw(route)):
                 if job["stop"] or route not in self.routes:
                     job["stop"] = True
                     break
@@ -687,7 +723,7 @@ class Forwarder:
     async def _iter_groups(self, route: dict, job: dict, floor: int):
         """Yield the not yet resolved messages of a route's source, oldest first; an album is ONE group."""
         group: list = []
-        async for m in self.userbot.iter_messages(route["src"], reverse=True, min_id=floor):
+        async for m in self.userbot.iter_messages(route["src"], reverse=True, min_id=floor, **self._read_kw(route)):
             if job["stop"] or route not in self.routes:
                 job["stop"] = True
                 return
@@ -709,14 +745,15 @@ class Forwarder:
         keeps its own job / ledger, so the result is the same as separate runs - only the ORDER is mixed."""
         states = []
         for route, job in pairs:
-            key = route_key(route["src"], route["dst"])
+            key = rkey(route)
             floor = self.ledger.resume_from(key)
             states.append({"route": route, "job": job, "key": key, "last": floor, "done": False,
                            "gen": self._iter_groups(route, job, floor)})
         try:
             for st in states:
                 try:
-                    st["job"]["total"] = int((await self.userbot.get_messages(st["route"]["src"], limit=0)).total or 0)
+                    st["job"]["total"] = int((await self.userbot.get_messages(
+                        st["route"]["src"], limit=0, **self._read_kw(st["route"]))).total or 0)
                 except Exception as exc:
                     log.debug("could not count the messages of %s: %s", st["route"]["src"], exc)
             while any(not st["done"] for st in states):
@@ -801,7 +838,7 @@ class Forwarder:
         When the process is shutting down the job was only interrupted, so it stays on the list."""
         if self._shutting_down:
             return
-        key = route_key(job["src"], job["dst"])
+        key = rkey(job)
         if key in self.resume_keys:
             self.resume_keys.remove(key)
             try:
@@ -819,7 +856,7 @@ class Forwarder:
         already copied, so only the rest is sent (and nothing twice). Returns the number of routes resumed."""
         if not self.resume_keys:
             return 0
-        by_key = {route_key(r["src"], r["dst"]): r for r in self.routes}
+        by_key = {rkey(r): r for r in self.routes}
         gone = [k for k in self.resume_keys if k not in by_key]
         if gone:                                    # route deleted meanwhile
             self.resume_keys = [k for k in self.resume_keys if k in by_key]
@@ -882,7 +919,7 @@ class Forwarder:
         duplicate. A route can have its own counter (`serial_start`) - then the same number may exist in two routes,
         so the database id gets a short suffix when it is taken. With serial numbers OFF nothing is shown, a hidden
         id is still kept for /find."""
-        key = route_key(route["src"], route["dst"])
+        key = rkey(route)
         if not route.get("serial_on", True):
             for _ in range(100):
                 uid = new_uid()                      # hidden: prefix + time + random, uses no number
@@ -913,7 +950,7 @@ class Forwarder:
         uid, shown, give_back = await self._uid_for(route, first_msg)
         self._busy[dst] = self._busy.get(dst, 0) + 1
         try:
-            sent = await self._send(dst, shown, raw, ents, specs, preview)
+            sent = await self._send(dst, shown, raw, ents, specs, preview, topic=_topic_id(route.get("dst_topic")))
         except BaseException:
             await db.fwd_drop(uid)
             give_back()                              # nothing was posted: the number is handed out again
@@ -932,52 +969,57 @@ class Forwarder:
             log.debug("could not save the details of %s: %s", uid, exc)
         log.info("copied %s:%s -> %s as %s", route["src"], first_msg.id, dst, shown or uid)
 
-    async def _send(self, dst, uid: str, raw, ents, specs: list[FileSpec], preview: bool) -> list:
+    async def _send(self, dst, uid: str, raw, ents, specs: list[FileSpec], preview: bool, topic: int = 0) -> list:
+        """Post to `dst`; with `topic` (a forum topic id, > 1) everything lands in that topic. The General topic (1)
+        is the chat itself, so it needs no reply target."""
         retry = self.pipeline._retry
+        into = {"reply_to": topic} if topic > 1 else {}   # a topic is addressed as a reply to its first message
         if not specs:
             text = build_html(raw, ents, uid, TEXT_LIMIT)
             return [await retry(lambda: self.userbot.send_message(
-                dst, text, parse_mode="html", link_preview=preview))]
+                dst, text, parse_mode="html", link_preview=preview, **into))]
         if len(specs) == 1 and specs[0].kind in NO_CAPTION:  # sticker / round video: id goes in a reply
-            media = await retry(lambda: self._send_one(dst, specs[0], None))
+            media = await retry(lambda: self._send_one(dst, specs[0], None, topic))
             if not uid and not raw:                  # serial numbers OFF and no text: nothing to say in a reply
                 return [media]
             text = build_html(raw, ents, uid, TEXT_LIMIT)
+            # in a topic the id is posted into the topic (a plain reply to the media would need the topic id as well)
             note = await retry(lambda: self.userbot.send_message(
-                dst, text, parse_mode="html", reply_to=media.id, link_preview=False))
+                dst, text, parse_mode="html", reply_to=topic if topic > 1 else media.id, link_preview=False))
             return [media, note]
         caption = build_html(raw, ents, uid, self.pipeline.caption_limit)
         if len(specs) == 1:
-            return [await retry(lambda: self._send_one(dst, specs[0], caption))]
+            return [await retry(lambda: self._send_one(dst, specs[0], caption, topic))]
         sent: list = []
         for i in range(0, len(specs), 10):           # Telegram albums hold at most 10 items
             chunk = specs[i:i + 10]
             cap = caption if i == 0 else None
             if len({s.force_document for s in chunk}) > 1:  # documents cannot share an album with photos
-                sent += await self._send_each(dst, chunk, cap)
+                sent += await self._send_each(dst, chunk, cap, topic)
                 continue
             try:
                 res = await retry(lambda: self.userbot.send_file(
                     dst, [s.path for s in chunk], caption=cap, parse_mode="html",
-                    force_document=chunk[0].force_document, supports_streaming=True, part_size_kb=512))
+                    force_document=chunk[0].force_document, supports_streaming=True, part_size_kb=512, **into))
                 sent += list(res) if isinstance(res, (list, tuple)) else [res]
             except errors.RPCError as exc:
                 log.warning("album send failed (%s) - sending the files one by one", short_error(exc))
-                sent += await self._send_each(dst, chunk, cap)
+                sent += await self._send_each(dst, chunk, cap, topic)
         return sent
 
-    async def _send_each(self, dst, specs, caption) -> list:
+    async def _send_each(self, dst, specs, caption, topic: int = 0) -> list:
         out = []
         for i, spec in enumerate(specs):
             out.append(await self.pipeline._retry(
-                lambda spec=spec, i=i: self._send_one(dst, spec, caption if i == 0 else None)))
+                lambda spec=spec, i=i: self._send_one(dst, spec, caption if i == 0 else None, topic)))
         return out
 
-    async def _send_one(self, dst, spec: FileSpec, caption: str | None):
+    async def _send_one(self, dst, spec: FileSpec, caption: str | None, topic: int = 0):
+        into = {"reply_to": topic} if topic > 1 else {}
         if spec.kind == "sticker":
-            return await self.userbot.send_file(dst, spec.document)
+            return await self.userbot.send_file(dst, spec.document, **into)
         kw: dict = {"caption": caption, "parse_mode": "html", "force_document": spec.force_document,
-                    "part_size_kb": 512}
+                    "part_size_kb": 512, **into}
         if spec.attributes:
             kw["attributes"] = spec.attributes
         if spec.thumb:
@@ -996,6 +1038,8 @@ class Forwarder:
         "1️⃣ In the <b>source</b> chat send <code>.fwdsrc</code>\n"
         "2️⃣ In the <b>destination</b> chat send <code>.fwddst</code>\n"
         "Or in one line: <code>.fwd @source @destination</code>\n"
+        "🧵 <b>Topics</b>: add <code>/topic</code> to either side, e.g. <code>.fwd -1001111111111/5 3617219724/119</code> "
+        "(topic 5 ➜ topic 119). Sent inside a topic, <code>.fwdsrc</code> / <code>.fwddst</code> pick that topic.\n"
         "👁 <b>Watch</b>: every new message of the source is copied automatically — "
         "<code>.fwd watch [n]</code> / <code>.fwd unwatch [n]</code>\n"
         "🔀 <b>Mixing</b>: <code>.fwd mix on|off</code> — with several routes, <code>.fwd all</code> sends 5 messages "
@@ -1027,8 +1071,33 @@ class Forwarder:
         except RuntimeError as exc:
             raise ValueError("that chat was not found - this account must be a member of it") from exc
 
+    async def _side(self, ref: str):
+        """``chat`` or ``chat/topic`` (3617219724/119, @group/119, a topic link) -> (entity, topic id, 0 = whole chat)."""
+        chat, topic = parse_chat_topic(ref)
+        ent = await self._entity(str(chat))
+        if topic and getattr(ent, "forum", None) is False:
+            raise ValueError(f"{self._name(ent)} has no topics (it is not a forum group)")
+        return ent, topic
+
     async def _chat_of(self, event, arg: str):
-        return await self._entity(arg) if arg else await event.get_chat()
+        """The chat and topic a command is about: the argument, else the chat (and topic) the command was typed in."""
+        if arg:
+            return await self._side(arg)
+        return await event.get_chat(), forum_topic_of(getattr(event, "message", None))
+
+    async def _label(self, ent, topic: int) -> str:
+        """Name shown in the lists: the chat, plus the topic title (or its number) when a topic is meant."""
+        name = self._name(ent)
+        if not topic:
+            return name
+        title = ""
+        try:
+            from telethon.tl.functions.channels import GetForumTopicsByIDRequest
+            res = await self.userbot(GetForumTopicsByIDRequest(channel=ent, topics=[topic]))
+            title = str(getattr(res.topics[0], "title", "") or "")
+        except Exception as exc:                    # the number alone is fine
+            log.debug("topic title not available: %s", exc)
+        return f"{name} ▸ {title or f'topic {topic}'}"
 
     @staticmethod
     def _name(ent) -> str:
@@ -1038,27 +1107,33 @@ class Forwarder:
             return "chat"
 
     async def _cmd_src(self, event, arg: str) -> str:
-        ent = await self._chat_of(event, arg)
-        self.pending = {"src": utils.get_peer_id(ent), "name": self._name(ent)}
+        ent, topic = await self._chat_of(event, arg)
+        self.pending = {"src": utils.get_peer_id(ent), "name": await self._label(ent, topic), "topic": topic}
         return (f"📤 Source: <b>{esc(self.pending['name'])}</b>\n"
-                "Now open the <b>destination</b> chat and send <code>.fwddst</code>")
+                "Now open the <b>destination</b> chat (or one of its topics) and send <code>.fwddst</code>")
 
     async def _cmd_dst(self, event, arg: str) -> str:
         if not self.pending:
             raise ValueError("first send .fwdsrc in the source chat (or use .fwd @source @destination)")
-        ent = await self._chat_of(event, arg)
+        ent, topic = await self._chat_of(event, arg)
         src = self.pending
         self.pending = None
-        return await self._add_route(src["src"], src["name"], ent)
+        return await self._add_route(src["src"], src["name"], ent, src_topic=src.get("topic", 0), dst_topic=topic)
 
-    async def _check_route(self, src_id: int, dst_ent) -> int:
+    async def _check_route(self, src_id: int, dst_ent, src_topic: int = 0, dst_topic: int = 0) -> int:
         """Raise ValueError unless THIS account may create the route src -> dst. Returns the destination id."""
         dst_id = utils.get_peer_id(dst_ent)
-        if dst_id == src_id:
-            raise ValueError("source and destination must be different chats")
-        if any(r["src"] == src_id and r["dst"] == dst_id for r in self.routes):
+        if dst_id == src_id:                         # one forum group: topic -> another topic is fine
+            if not (src_topic and dst_topic):
+                raise ValueError("source and destination must be different chats "
+                                 "(inside one group name both topics: chat/5 and chat/119)")
+            if src_topic == dst_topic:
+                raise ValueError("source and destination must be different topics")
+        if any(r["src"] == src_id and r["dst"] == dst_id and _topic_id(r.get("src_topic")) == src_topic
+               and _topic_id(r.get("dst_topic")) == dst_topic for r in self.routes):
             raise ValueError("this route already exists (.fwd list)")
-        if any(r["src"] == dst_id and r["dst"] == src_id for r in self.routes):
+        if any(r["src"] == dst_id and r["dst"] == src_id and _topic_id(r.get("src_topic")) == dst_topic
+               and _topic_id(r.get("dst_topic")) == src_topic for r in self.routes):
             raise ValueError("the reverse route exists - both directions would copy each other forever")
         if getattr(dst_ent, "broadcast", False):
             try:
@@ -1076,18 +1151,19 @@ class Forwarder:
         """Used by the account choice: None = this account can make the route src -> dst (it is a member of both
         chats and may post in the destination), otherwise a short reason why it cannot."""
         try:
-            src = await self._entity(src_ref)
-            dst = await self._entity(dst_ref)
-            await self._check_route(utils.get_peer_id(src), dst)
+            src, src_topic = await self._side(src_ref)
+            dst, dst_topic = await self._side(dst_ref)
+            await self._check_route(utils.get_peer_id(src), dst, src_topic, dst_topic)
         except ValueError as exc:
             return str(exc)
         return None
 
-    async def _add_route(self, src_id: int, src_name: str, dst_ent) -> str:
-        dst_id = await self._check_route(src_id, dst_ent)
-        dst_name = self._name(dst_ent)
+    async def _add_route(self, src_id: int, src_name: str, dst_ent, src_topic: int = 0, dst_topic: int = 0) -> str:
+        dst_id = await self._check_route(src_id, dst_ent, src_topic, dst_topic)
+        dst_name = await self._label(dst_ent, dst_topic)
         self.routes.append(route_defaults({"src": src_id, "dst": dst_id, "src_name": src_name,
-                                           "dst_name": dst_name, "active": True}))
+                                           "dst_name": dst_name, "active": True,
+                                           "src_topic": src_topic, "dst_topic": dst_topic}))
         await self._persist()
         return (f"✅ <b>Route #{len(self.routes)}</b>: {esc(src_name)} ➜ {esc(dst_name)}\n"
                 "👁 Every new message there is now copied (download + upload) with a serial number.\n"
@@ -1098,9 +1174,10 @@ class Forwarder:
             return "ℹ️ No routes yet.\n\n" + self.HELP
         lines = ["🔁 <b>Forward routes</b>"]
         for i, r in enumerate(self.routes, 1):
-            done = self.ledger.count(route_key(r["src"], r["dst"]))
-            lines.append(f"{i}. {'👁' if r['active'] else '⏸'} {esc(r['src_name'])} <code>{r['src']}</code> ➜ "
-                         f"{esc(r['dst_name'])} <code>{r['dst']}</code> · {done} copied")
+            done = self.ledger.count(rkey(r))
+            st, dt = r.get("src_topic", 0), r.get("dst_topic", 0)
+            lines.append(f"{i}. {'👁' if r['active'] else '⏸'} {esc(r['src_name'])} <code>{r['src']}{f'/{st}' if st else ''}</code> ➜ "
+                         f"{esc(r['dst_name'])} <code>{r['dst']}{f'/{dt}' if dt else ''}</code> · {done} copied")
         lines.append(f"\n👁 = watching new messages · ⏸ = paused · 🔗 links removed: {'yes' if self.strip_links else 'no'}")
         if len(self.routes) > 1:
             lines.append(f"🔀 Mixing: {'ON' if self.mixing else 'OFF'} (Forward all: {MIX_BATCH} messages per route in turns)")
@@ -1213,10 +1290,11 @@ class Forwarder:
             a, b = msg_link(row["src_chat"], row["src_msg"]), msg_link(row["dst_chat"], row["dst_msg"])
             return (f"🆔 <code>{esc(row['uid'])}</code>\nsource: <code>{row['src_chat']}</code> msg {row['src_msg']} "
                     f"{esc(a)}\ncopy: <code>{row['dst_chat']}</code> msg {row['dst_msg']} {esc(b)}")
-        if len(parts) == 2:  # .fwd <source> <destination>
-            src = await self._entity(parts[0])
-            dst = await self._entity(parts[1])
-            return await self._add_route(utils.get_peer_id(src), self._name(src), dst)
+        if len(parts) == 2:  # .fwd <source> <destination>   (each: chat or chat/topic)
+            src, src_topic = await self._side(parts[0])
+            dst, dst_topic = await self._side(parts[1])
+            return await self._add_route(utils.get_peer_id(src), await self._label(src, src_topic), dst,
+                                         src_topic=src_topic, dst_topic=dst_topic)
         raise ValueError("unknown usage - send .fwd help")
 
     # ---------------------------------------------------------------- housekeeping

@@ -314,13 +314,13 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
         return "\n".join(lines), rows + [ui.nav_row(b"m:fw")]
 
     def serial_line(r: dict) -> str:
-        from unified_services.forwarder import new_uid
+        from unified_services.forwarder import new_uid, rkey
         if not r.get("serial_on", True):
             return "OFF ❌ (copies are posted without an ID)"
         start = int(r.get("serial_start") or 0)
         if start <= 0:
             return "ON ✅ · global counter"
-        last = getattr(fwd().ledger, "route_serial", {}).get(f"{r['src']}>{r['dst']}")
+        last = getattr(fwd().ledger, "route_serial", {}).get(rkey(r))
         return f"ON ✅ · own counter, next <b>{new_uid(serial=(last + 1) if last else start)}</b>"
 
     def s_route_bans(i: int):
@@ -389,7 +389,8 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
         "BD_START": ui.head("🗑", "Bulk delete") + "\n" + ui.step(1, 2, "send the link of the <b>first</b> (oldest) message "
                     "to delete, e.g. <code>https://t.me/c/2940625991/2236</code>"),
         "FWD_SRC": ui.head("📤", "Add route") + "\n" + ui.step(1, 2, "send the <b>source</b> chat "
-                    "(<code>@username</code>, link or id)."),
+                    "(<code>@username</code>, link or id).\n"
+                    "🧵 For one topic of a forum group add <code>/topic</code>, e.g. <code>-1001234567890/119</code>."),
     }
     BACKS = {"WM_TEXT": b"m:wm", "WM_TEXT_COLOR": b"m:wm", "WM_BG_COLOR": b"m:wm", "TARGET": b"m:set",
              "FWD_SRC": b"m:fw", "FWD_DST": b"m:fw", "BAN": b"m:bn",
@@ -763,7 +764,8 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
                     ui.confirm_row(f"🗑 Yes, delete {plan.total}", b"m:bdy", b"m:cancel")])
             if kind == "FWD_SRC":
                 pending[event.sender_id] = {"kind": "FWD_DST", "back": back, "src": val}
-                return await event.respond(ui.head("📥", "Add route") + "\n" + ui.step(2, 2, "send the <b>destination</b> chat."),
+                return await event.respond(ui.head("📥", "Add route") + "\n" + ui.step(2, 2, "send the <b>destination</b> chat.\n"
+                                                                           "🧵 To post into one topic: <code>-1003617219724/119</code>"),
                                            buttons=[ui.cancel_row()])
             if kind == "FWD_DST":
                 if len(fw_accounts()) > 1:

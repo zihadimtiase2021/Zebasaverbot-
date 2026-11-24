@@ -30,8 +30,12 @@ MAX_CHARS = 3600          # a Telegram message holds 4096 characters (non-Premiu
 FLUSH_DELAY = 2.0         # seconds: several copies in a row are written with one edit
 
 
-def route_key(src: int, dst: int) -> str:
-    return f"{src}>{dst}"
+def route_key(src: int, dst: int, src_topic: int = 0, dst_topic: int = 0) -> str:
+    """Ledger key of a route. Without topics it is the old ``src>dst`` (saved ledgers keep working); a topic is
+    appended as ``#id``: ``-1001#5>-1002#119``."""
+    a = f"{src}#{src_topic}" if src_topic else f"{src}"
+    b = f"{dst}#{dst_topic}" if dst_topic else f"{dst}"
+    return f"{a}>{b}"
 
 
 class Ledger:

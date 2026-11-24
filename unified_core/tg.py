@@ -29,6 +29,39 @@ def parse_chat_ref(text: str) -> int | str:
     raise ValueError("expected an @username, a t.me link or a numeric chat ID")
 
 
+def parse_chat_topic(text: str) -> tuple[int | str, int]:
+    """Chat reference with an optional forum topic -> (chat ref, topic id); topic 0 = the whole chat.
+
+    ``3617219724/119`` · ``-1003617219724/119`` · ``@group/119`` · ``https://t.me/c/3617219724/119`` (topic link)
+    ``3617219724`` / ``@group`` (no topic) -> topic 0.  Topic 1 is the "General" topic.
+    """
+    t = (text or "").strip().strip("\"'")
+    if not t:
+        raise ValueError("empty value")
+    m = _TME.match(t)
+    if m:
+        parts = [x for x in m.group(1).split("?")[0].split("#")[0].split("/") if x]
+        if parts and parts[0] == "c" and len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
+            return int(f"-100{parts[1]}"), int(parts[2])
+        if len(parts) >= 2 and _USERNAME.match(parts[0]) and parts[1].isdigit():
+            return parts[0], int(parts[1])
+        return parse_chat_ref(t), 0
+    if "/" in t:
+        ref, _, top = t.rpartition("/")
+        if not top.strip().isdigit() or int(top) < 1:
+            raise ValueError("the topic must be a number: chat/topic, e.g. -1003617219724/119")
+        return parse_chat_ref(ref), int(top)
+    return parse_chat_ref(t), 0
+
+
+def forum_topic_of(msg) -> int:
+    """Topic id of a message sent inside a forum topic, 0 when it carries no topic (plain chat, or the General topic)."""
+    rt = getattr(msg, "reply_to", None)
+    if rt is not None and getattr(rt, "forum_topic", False):
+        return int(getattr(rt, "reply_to_top_id", None) or getattr(rt, "reply_to_msg_id", None) or 0)
+    return 0
+
+
 async def resolve_peer(client, raw: int | str):
     """Resolve a chat. Accepts marked (-100...) ids, bare channel ids and usernames."""
     candidates: list[int | str] = [raw]

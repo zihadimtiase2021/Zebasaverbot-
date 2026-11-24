@@ -47,6 +47,21 @@ Telegram's forwarding is disabled: it never uses "forward", the media is **downl
 needs to be a member of the source and be allowed to post in the destination.
 1. In the **source** chat send `.fwdsrc` (the answer disappears after 20 s)
 2. In the **destination** chat send `.fwddst` → the route exists. (Or in one line: `.fwd @source @destination`, `.fwd -1001234 -1005678`, `.fwd https://t.me/c/123/1 @dest`.)
+### 🧵 Forum topics (source and / or destination)
+Add `/topic-id` to a chat to mean **one topic** of a forum group (`chat_id/topic_id`), on either side:
+
+| Command | Does |
+|---|---|
+| `.fwd @source -1003617219724/119` | whole source chat ➜ topic **119** of the destination group |
+| `.fwd -1001111111111/5 3617219724/119` | topic **5** of the source group ➜ topic **119** of the destination group |
+| `.fwd -1003617219724/5 -1003617219724/119` | topic ➜ topic inside **one** group (both topics must be named) |
+| `.fwdsrc` / `.fwddst` typed **inside a topic** | picks that topic automatically (`.fwdsrc 3617219724/5` also works from anywhere) |
+
+* The id works with or without `-100` in front (`3617219724/119` = `-1003617219724/119`), with `@group/119`, and with a topic link `https://t.me/c/3617219724/119`.
+* The topic id is the number in a topic link (the id of the topic's first message); topic `1` is **General**.
+* A route with a source topic copies only that topic (Watch and Forward all). Every topic route has its own "already copied" history, so the same
+  chat can feed several topics without duplicates. The bot menu (🔁 Forward ➜ ➕ Add route) accepts the same `chat/topic` text.
+
 3. Every copy ends with a **serial number** that counts up, e.g. `ZF-000123` (tap to copy). `.fwd id 123` shows which source message it came from and where the copy is.
 
 ### Watch, Forward all, no duplicates, no links
