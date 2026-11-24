@@ -172,3 +172,84 @@ def test_watch_pause_links_switch_and_stop(monkeypatch, tmp_path):
             await db.close()
 
     asyncio.run(go())
+
+
+def test_reset_progress_clears_history_counters_and_saves(monkeypatch, tmp_path):
+    from unified_core.config import settings
+    from unified_core.database import db
+    from unified_services import forwarder as F
+
+    monkeypatch.setattr(settings, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(settings, "FWD_DELAY", 0)
+
+    async def go():
+        await db.connect(":memory:")
+        try:
+            cl, pipe = Client({-1001: [Msg(1, "a"), Msg(2, "b")]}), Pipe()
+            fw = F.Forwarder(cl, pipe)
+            await fw._add_route(-1001, "Src", Ent(-1002, "Dst", True))
+            route = fw.routes[0]
+            await fw._cmd_fwd("all")
+            for _ in range(200):
+                job = fw._job_for(route)
+                if job and job["state"] != "running":
+                    break
+                await asyncio.sleep(0.05)
+            assert job["sent"] >= 1 and job["last_id"] >= 1 and fw.ledger.has("-1001>-1002", 1)
+            fw.jobs[F.route_key(-1001, -1002)]["state"] = "running"
+            with pytest.raises(ValueError):                              # running: refused, nothing cleared
+                await fw.reset_progress([route])
+            assert fw.ledger.has("-1001>-1002", 1)
+            fw.jobs[F.route_key(-1001, -1002)]["state"] = "done"
+            out = await fw.reset_progress([route])
+            assert "Progress reset" in out
+            assert not fw.ledger.has("-1001>-1002", 1) and fw._job_for(route) is None
+            assert "Nothing was started" in fw._fmt_progress() and not fw.ledger._dirty   # saved immediately
+            fw._worker.cancel()
+        finally:
+            await db.close()
+
+    asyncio.run(go())
+
+
+def test_watch_off_stops_auto_forward_but_forward_all_works_and_state_is_saved(monkeypatch, tmp_path):
+    from unified_core.config import settings
+    from unified_core.database import db
+    from unified_services import forwarder as F
+
+    monkeypatch.setattr(settings, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(settings, "FWD_DELAY", 0)
+
+    class Store:                                    # stands in for RuntimeConfig (Saved Messages)
+        def __init__(self):
+            self.saved = {}
+
+        async def save(self):
+            pass
+
+    async def go():
+        await db.connect(":memory:")
+        try:
+            store = Store()
+            cl, pipe = Client({-1001: [Msg(1, "old")]}), Pipe()
+            fw = F.Forwarder(cl, pipe, store=store)
+            await fw._add_route(-1001, "Src", Ent(-1002, "Dst", True))
+            assert fw.watch is True and fw._wanted(-1001, Msg(5, "new"))
+            assert "OFF" in await fw.set_watch(False)
+            assert not fw._wanted(-1001, Msg(5, "new")) and store.saved[F.WATCH_KEY] is False
+            await fw._cmd_fwd("all")                    # manual Forward all is not affected by Watch
+            for _ in range(200):
+                job = fw._job_for(fw.routes[0])
+                if job and job["state"] != "running":
+                    break
+                await asyncio.sleep(0.05)
+            assert job["sent"] == 1
+            fw2 = F.Forwarder(Client({}), Pipe(), store=store)     # "restart": the state is read back
+            await fw2.load()
+            assert fw2.watch is False and not fw2._wanted(-1001, Msg(6, "x"))
+            assert "ON" in await fw2.set_watch(True) and fw2._wanted(-1001, Msg(6, "x"))
+            fw._worker.cancel()
+        finally:
+            await db.close()
+
+    asyncio.run(go())

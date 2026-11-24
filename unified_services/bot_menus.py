@@ -196,9 +196,10 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
         many = len(fw_accounts()) > 1
         if many:
             head = f"👤 <b>Account: {html.escape(fw_entry()[1])}</b>\n" + head
-        txt = (head + "\n\n" + ui.hint("👁/⏸ watch new messages on/off (tap the route) · 📥 All = copy the whole source, "
-                                       "only what was not copied before · 🗑 deletes the route."))
-        extra = []
+        txt = (head + "\n\n" + ui.hint("Watch ON = new messages are copied automatically (👁/⏸ per route: tap it) · "
+                                       "📥 All = copy the whole source, only what was not copied before · "
+                                       "🗑 deletes the route."))
+        extra = [[B(f"👁 Watch: {ON(getattr(fw, 'watch', True))}", b"m:fwt")]]
         if fw.routes:
             extra.append([B("📥 Forward all (every route)", b"m:fl:0"), B("📊 Progress", b"m:fg")])
         if len(fw.routes) > 1:
@@ -215,7 +216,52 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
 
     def s_progress():
         fw = fwd()
-        return (fw._fmt_progress(), [[B(ui.L_REFRESH, b"m:fg")], ui.nav_row(b"m:fw")])
+        rows = [[B(ui.L_REFRESH, b"m:fg")]]
+        if getattr(fw, "routes", None):
+            rows.append([B("🔄 Reset Progress", b"m:fr")])
+        return fw._fmt_progress(), rows + [ui.nav_row(b"m:fw")]
+
+    def reset_targets(i: int) -> list[dict]:
+        """Route number i (1-based), or every route for 0. Raises IndexError when the number is stale."""
+        fw = fwd()
+        if i == 0:
+            return list(fw.routes)
+        if not 1 <= i <= len(fw.routes):
+            raise IndexError("That route no longer exists.")
+        return [fw.routes[i - 1]]
+
+    def is_running(r: dict) -> bool:
+        job = fwd()._job_for(r)
+        return job is not None and job["state"] == "running"
+
+    def s_reset_pick():
+        """Reset Progress, step 1: which route (or all of them)."""
+        fw = fwd()
+        rows = [[B(f"{'⏳ ' if is_running(r) else ''}#{i} {r['src_name'][:11]}➜{r['dst_name'][:11]}",
+                   f"m:frc:{i}".encode())] for i, r in enumerate(fw.routes, 1)]
+        if len(fw.routes) > 1:
+            rows.append([B("🔄 All routes", b"m:frc:0")])
+        txt = (ui.head("🔄", "Reset Progress", "Which route should start fresh?") + "\n"
+               + ui.hint("⏳ = Forward all is running there (stop it first)."))
+        return txt, rows + [ui.nav_row(b"m:fg")]
+
+    def s_reset_confirm(i: int):
+        """Reset Progress, step 2: confirm - or, while a Forward all is running, ask to stop it first."""
+        fw = fwd()
+        targets = reset_targets(i)
+        names = "\n".join(f"• {html.escape(r['src_name'])} ➜ {html.escape(r['dst_name'])}" for r in targets)
+        running = [(n, r) for n, r in enumerate(fw.routes, 1) if r in targets and is_running(r)]
+        if running:
+            txt = (ui.head("⚠️", "Stop Forward all first") + "\n"
+                   "A Forward all is still running for:\n"
+                   + "\n".join(f"• {html.escape(r['src_name'])} ➜ {html.escape(r['dst_name'])}" for _n, r in running)
+                   + "\n\n" + ui.hint("Stop it, then come back and reset."))
+            return txt, [*[[B(f"⏹ Stop #{n}", f"m:fx:{n}".encode())] for n, _r in running], ui.nav_row(b"m:fg")]
+        txt = (ui.head("🔄", "Reset progress?") + "\n" + names + "\n\n"
+               "This clears the copied history (so nothing counts as “already copied”), the counters "
+               "(copied, already copied, skipped, failed, looked at) and the last forwarded message ID.\n"
+               + ui.hint("The next Forward all starts from the beginning. Serial numbers keep counting."))
+        return txt, [ui.confirm_row("🔄 Yes, reset", f"m:fry:{i}", b"m:fg")]
 
     def s_accounts():
         """Which account's forwarding the Forward screens show / change."""
@@ -402,6 +448,21 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
                 return await put(event, s_forward())
             if a == "fg":
                 return await put(event, s_progress())
+            if a == "fr":      # Reset Progress: pick the route (straight to the question when there is only one)
+                fw = fwd()
+                if not fw.routes:
+                    return await put(event, s_progress())
+                return await put(event, s_reset_confirm(1) if len(fw.routes) == 1 else s_reset_pick())
+            if a == "frc":
+                return await put(event, s_reset_confirm(int(p[2])))
+            if a == "fry":     # Reset Progress: confirmed
+                ans = await fwd().reset_progress(reset_targets(int(p[2])))
+                await event.answer(ui.plain(ans))
+                return await put(event, s_progress())
+            if a == "fwt":     # Watch ON / OFF (auto-forward new messages); a quiet toast, the button shows the state
+                fw = fwd()
+                await event.answer(ui.plain(await fw.set_watch(not getattr(fw, "watch", True))))
+                return await put(event, s_forward())
             if a == "fm":      # Mixing ON / OFF
                 fw = fwd()
                 await event.answer(ui.plain(await fw.set_mixing(not fw.mixing)), alert=True)

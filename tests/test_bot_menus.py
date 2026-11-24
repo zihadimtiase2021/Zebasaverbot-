@@ -226,3 +226,92 @@ def test_stepper_layout_and_rotate_and_bans():
     run(cb2(Ev(b"m:ask:BAN")))
     run(nm2(Ev(text="foo, bar")))
     assert app.forwarder.calls[-1] == "ban foo, bar"
+
+
+def test_reset_progress_flow_confirms_and_refuses_while_running():
+    rt, _, _ = make()
+    r1 = {"src": 1, "dst": 2, "src_name": "A", "dst_name": "B", "active": True}
+    r2 = {"src": 3, "dst": 4, "src_name": "C", "dst_name": "D", "active": True}
+
+    class FW:
+        routes, bans, calls, resets = [r1, r2], [], [], []
+        strip_links, running = True, set()
+
+        def _job_for(self, r):
+            return {"state": "running"} if r["src"] in self.running else None
+
+        def _fmt_progress(self):
+            return "progress text"
+
+        async def reset_progress(self, routes):
+            if any(r["src"] in self.running for r in routes):
+                raise ValueError("Forward all is still running - stop it first")
+            self.resets.append([r["src"] for r in routes])
+            return "🔄 <b>Progress reset</b>: A ➜ B"
+
+    app = types.SimpleNamespace(runtime=rt, forwarder=FW(), pipeline=None)
+    bot = FakeBot()
+    bot_menus.register_bot_menus(app, bot, lambda uid: True)
+    cb = bot.h["cb"]
+
+    ev = Ev(b"m:fg")                                   # the Progress screen has the button
+    run(cb(ev))
+    assert (("🔄 Reset Progress", b"m:fr") in [b for r in ev.out[0][2] for b in r])
+
+    ev = Ev(b"m:fr")                                   # several routes: pick one (or all)
+    run(cb(ev))
+    data = [d for r in ev.out[0][2] for _t, d in r]
+    assert b"m:frc:1" in data and b"m:frc:2" in data and b"m:frc:0" in data and not app.forwarder.resets
+
+    ev = Ev(b"m:frc:1")                                # nothing is reset before the confirmation
+    run(cb(ev))
+    assert "Reset progress?" in ev.out[0][1] and not app.forwarder.resets
+    assert [d for r in ev.out[0][2] for _t, d in r] == [b"m:fry:1", b"m:fg"]
+
+    run(cb(Ev(b"m:fry:1")))
+    run(cb(Ev(b"m:fry:0")))
+    assert app.forwarder.resets == [[1], [1, 3]]
+
+    app.forwarder.running = {3}                        # running: warn + Stop button, no reset
+    ev = Ev(b"m:frc:0")
+    run(cb(ev))
+    assert "Stop Forward all first" in ev.out[0][1] and b"m:fx:2" in [d for r in ev.out[0][2] for _t, d in r]
+    ev = Ev(b"m:fry:2")                                # even a stale confirm cannot reset a running route
+    run(cb(ev))
+    assert ev.out[0][0] == "answer" and ev.out[0][2] and app.forwarder.resets == [[1], [1, 3]]
+
+    ev = Ev(b"m:frc:9")                                # stale route number -> popup, no crash
+    run(cb(ev))
+    assert ev.out[0][0] == "answer" and ev.out[0][2]
+
+
+def test_watch_toggle_button_and_toast():
+    rt, _, _ = make()
+
+    class FW:
+        routes, bans, strip_links, watch = [], [], True, True
+
+        def _fmt_routes(self):
+            return "routes"
+
+        def _job_for(self, r):
+            return None
+
+        async def set_watch(self, on):
+            self.watch = on
+            return f"👁 Watch <b>{'ON' if on else 'OFF'}</b>: details"
+
+    app = types.SimpleNamespace(runtime=rt, forwarder=FW(), pipeline=None)
+    bot = FakeBot()
+    bot_menus.register_bot_menus(app, bot, lambda uid: True)
+    cb = bot.h["cb"]
+    ev = Ev(b"m:fw")
+    run(cb(ev))
+    assert ("👁 Watch: ON ✅", b"m:fwt") in [b for r in ev.out[0][2] for b in r]
+    ev = Ev(b"m:fwt")                                    # tap: OFF, a toast (not a popup), screen redrawn
+    run(cb(ev))
+    assert app.forwarder.watch is False
+    assert ev.out[0][0] == "answer" and "Watch OFF" in ev.out[0][1] and not ev.out[0][2]
+    assert ("👁 Watch: OFF ❌", b"m:fwt") in [b for r in ev.out[1][2] for b in r]
+    run(cb(Ev(b"m:fwt")))
+    assert app.forwarder.watch is True

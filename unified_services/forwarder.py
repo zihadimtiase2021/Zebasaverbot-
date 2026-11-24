@@ -50,6 +50,7 @@ ROUTES_KEY = "FWD_ROUTES"
 BAN_KEY = "FWD_BAN"
 LINKS_KEY = "FWD_LINKS"
 MIX_KEY = "FWD_MIX"
+WATCH_KEY = "FWD_WATCH"                         # global Watch (auto-forward new messages) ON / OFF
 JOBS_KEY = "FWD_JOBS"                           # routes whose "Forward all" is running -> resumed after a redeploy
 MIX_BATCH = 5                                  # messages per route and turn in Mixing mode
 TEXT_LIMIT = 4096
@@ -160,6 +161,7 @@ class Forwarder:
         self._shutting_down = False        # True while the process stops: interrupted jobs must stay on the list
         self._bg_tasks: set = set()
         self.mixing = False                # Forward all over several routes: 5 messages per route, round-robin
+        self.watch = True                  # Watch: copy NEW incoming messages automatically (OFF: only Forward all copies)
         self.ledger = Ledger(userbot, db)  # what was copied already (per route) + serial counter
         self.jobs: dict[str, dict] = {}    # route key -> progress of a running / finished "Forward all"
         self.pending: dict | None = None   # source chosen with .fwdsrc, waiting for .fwddst
@@ -193,6 +195,8 @@ class Forwarder:
             self.strip_links = self.store.saved[LINKS_KEY]
         if self.store is not None and isinstance(self.store.saved.get(MIX_KEY), bool):
             self.mixing = self.store.saved[MIX_KEY]
+        if self.store is not None and isinstance(self.store.saved.get(WATCH_KEY), bool):
+            self.watch = self.store.saved[WATCH_KEY]
         if self.store is not None and isinstance(self.store.saved.get(JOBS_KEY), list):
             self.resume_keys = [k for k in self.store.saved[JOBS_KEY] if isinstance(k, str)]
         await self.ledger.load()
@@ -238,6 +242,7 @@ class Forwarder:
             self.store.saved[BAN_KEY] = self.bans
             self.store.saved[LINKS_KEY] = self.strip_links
             self.store.saved[MIX_KEY] = self.mixing
+            self.store.saved[WATCH_KEY] = self.watch
             self.store.saved[JOBS_KEY] = list(self.resume_keys)
             try:
                 await self.store.save()
@@ -274,7 +279,7 @@ class Forwarder:
         return bool(getattr(msg, "raw_text", "") or _media_kind(msg))
 
     def _wanted(self, chat_id: int, msg) -> list[dict]:
-        if not settings.FWD_ENABLED:
+        if not settings.FWD_ENABLED or not self.watch:   # Watch OFF: new messages are left alone (Forward all still works)
             return []
         routes = self._routes_for(chat_id)
         if not routes or not self._copyable(chat_id, msg):
@@ -496,6 +501,31 @@ class Forwarder:
                 job["note"] = "stopped by you"
                 n += 1
         return n
+
+    async def reset_progress(self, routes: list[dict]) -> str:
+        """Start fresh for `routes`: forget what was copied (ledger), drop the saved / finished Forward all job
+        (copied, already copied, skipped, failed, looked at and the last forwarded message ID go back to 0) and save
+        it at once to Saved Messages. Refused while a Forward all is running for one of them. Serial numbers keep
+        counting, so the IDs of new copies never repeat."""
+        busy = [r for r in routes if (self._job_for(r) or {}).get("state") == "running"]
+        if busy:
+            names = ", ".join(f"{r['src_name']} ➜ {r['dst_name']}" for r in busy)
+            raise ValueError(f"Forward all is still running for {names} - stop it first")
+        for r in routes:
+            key = route_key(r["src"], r["dst"])
+            self.ledger.forget(key)
+            self.jobs.pop(key, None)
+            if key in self.resume_keys:
+                self.resume_keys.remove(key)
+        await self._persist()
+        await self.ledger.flush()                  # now, not after the debounce: the reset must survive a redeploy
+        names = ", ".join(f"{esc(r['src_name'])} ➜ {esc(r['dst_name'])}" for r in routes)
+        text = (f"🔄 <b>Progress reset</b>: {names}\n"
+                "Counters, last forwarded message ID and the copied history are cleared. "
+                "The next <code>.fwd all</code> starts from the beginning.")
+        if getattr(self.ledger, "_dirty", False):  # the Saved Messages write failed; it is retried automatically
+            text += "\n⚠️ Could not save to Saved Messages yet - it is retried automatically."
+        return text
 
     async def _queue_group(self, job: dict, route: dict, msgs: list) -> bool:
         key = route_key(route["src"], route["dst"])
@@ -723,6 +753,13 @@ class Forwarder:
         except Exception as exc:
             log.debug("could not send the resume notice: %s", exc)
         return len(routes)
+
+    async def set_watch(self, on: bool) -> str:
+        self.watch = on
+        await self._persist()                       # saved to Saved Messages: survives restarts and redeploys
+        if on:
+            return "👁 Watch <b>ON</b>: new messages of the source chats are copied automatically."
+        return "⏸ Watch <b>OFF</b>: new messages are not copied. Forward all still works."
 
     async def set_mixing(self, on: bool) -> str:
         self.mixing = on
@@ -1036,7 +1073,7 @@ class Forwarder:
             job = self._job_for(r)
             if job is not None and job["state"] == "running":
                 raise ValueError("Forward all is running for that route - .fwd stop first")
-            self.ledger.forget(route_key(r["src"], r["dst"]))
+            await self.reset_progress([r])
             return (f"♻️ Forgot what was copied for {esc(r['src_name'])} ➜ {esc(r['dst_name'])}. "
                     "The next <code>.fwd all</code> copies everything again.")
         if sub in ("ban", "bans", "unban"):
