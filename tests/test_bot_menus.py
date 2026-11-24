@@ -315,3 +315,131 @@ def test_watch_toggle_button_and_toast():
     assert ("👁 Watch: OFF ❌", b"m:fwt") in [b for r in ev.out[1][2] for b in r]
     run(cb(Ev(b"m:fwt")))
     assert app.forwarder.watch is True
+
+
+def test_route_settings_screens_and_actions():
+    rt, _, _ = make()
+    r1 = {"src": 1, "dst": 2, "src_name": "A", "dst_name": "B", "active": True}      # an OLD route: no new fields
+    r2 = {"src": 3, "dst": 4, "src_name": "C", "dst_name": "D", "active": True, "bans": ["x"], "ban_mode": "add",
+          "serial_on": True, "serial_start": 7}
+
+    class Ledger:
+        route_serial = {"3>4": 9}
+
+    class FW:
+        routes, bans, strip_links, watch, mixing = [r1, r2], ["g"], True, True, False
+        ledger, calls, started, stopped, running = Ledger(), [], [], [], set()
+
+        def _fmt_routes(self):
+            return "routes"
+
+        def _job_for(self, r):
+            return {"state": "running", "sent": 3, "scanned": 8} if r["src"] in self.running else None
+
+        def start_all(self, routes):
+            self.started.append([r["src"] for r in routes])
+            self.running.add(routes[0]["src"])
+            return "📥 <b>Forward all</b> started: A ➜ B"
+
+        def stop_all(self, routes):
+            self.stopped.append([r["src"] for r in routes])
+            self.running.discard(routes[0]["src"])
+            return 1
+
+        async def _cmd_fwd(self, arg):
+            self.calls.append(arg)
+            i = int(arg.split()[1])
+            self.routes[i - 1]["active"] = arg.startswith("watch")
+            return "ok"
+
+        async def route_ban_add(self, r, text):
+            r.setdefault("bans", []).append(text)
+            return "✅ Route ban list: +1"
+
+        async def route_ban_remove(self, r, k):
+            r["bans"].pop(k)
+            return "✅ Removed"
+
+        async def route_ban_clear(self, r):
+            r["bans"] = []
+            return "✅ Route ban list cleared"
+
+        async def set_ban_mode(self, r, mode):
+            r["ban_mode"] = mode
+            return "mode " + mode
+
+        async def set_serial_on(self, r, on):
+            r["serial_on"] = on
+            return "serial " + str(on)
+
+        async def set_serial_start(self, r, n):
+            r["serial_start"] = n
+            return f"🔢 from {n}"
+
+        async def reset_serial(self, r):
+            r["serial_start"] = 0
+            return "global again"
+
+    app = types.SimpleNamespace(runtime=rt, forwarder=FW(), pipeline=None)
+    bot = FakeBot()
+    bot_menus.register_bot_menus(app, bot, lambda uid: True)
+    cb, nm = bot.h["cb"], bot.h["nm"]
+    data = lambda ev: [d for row in ev.out[0][2] for _t, d in row]            # noqa: E731
+
+    ev = Ev(b"m:fw")                                    # tapping a route opens its settings (not a toggle)
+    run(cb(ev))
+    assert b"m:rs:1" in data(ev) and b"m:rs:2" in data(ev)
+
+    ev = Ev(b"m:rs:1")                                  # an old route works with defaults; Back + Main menu row
+    run(cb(ev))
+    assert "Route #1" in ev.out[0][1] and "global counter" in ev.out[0][1]
+    assert data(ev)[:3] == [b"m:rsg:1", b"m:rsw:1", b"m:rsb:1"] and data(ev)[-2:] == [b"m:fw", b"menu"]
+
+    ev = Ev(b"m:rsg:1")                                 # start THIS route only, then the button turns into Stop
+    run(cb(ev))
+    assert app.forwarder.started == [[1]] and b"m:rsg:1" in data_of(ev, 1) and "Stop Forward" in str(ev.out[1][2])
+    run(cb(Ev(b"m:rsg:1")))
+    assert app.forwarder.stopped == [[1]] and app.forwarder.started == [[1]]    # nothing else started or stopped
+
+    run(cb(Ev(b"m:rsw:2")))                             # per-route Watch
+    assert app.forwarder.calls[-1] == "unwatch 2" and r2["active"] is False
+
+    ev = Ev(b"m:rsb:2")                                 # ban screen: list, add, clear, mode, Back to the route
+    run(cb(ev))
+    assert {b"m:rsba:2", b"m:rsbc:2", b"m:rsbm:2", b"m:rsbu:2:0", b"m:rs:2", b"menu"} <= set(data(ev))
+    run(cb(Ev(b"m:rsbm:2")))
+    assert r2["ban_mode"] == "only"
+    ev = Ev(b"m:rsbc:2")                                # clearing asks first
+    run(cb(ev))
+    assert r2["bans"] == ["x"] and data(ev) == [b"m:rsbcy:2", b"m:rsb:2"]
+    run(cb(Ev(b"m:rsbcy:2")))
+    assert r2["bans"] == []
+
+    ev = Ev(b"m:rsn:2")                                 # serial screen shows the route's own next number
+    run(cb(ev))
+    assert "ZF-000010" in ev.out[0][1] and b"m:rsnr:2" in data(ev)
+    run(cb(Ev(b"m:rsnt:2")))
+    assert r2["serial_on"] is False
+    ev = Ev(b"m:rsnr:2")                                # reset asks first
+    run(cb(ev))
+    assert r2["serial_start"] == 7 and data(ev) == [b"m:rsnry:2", b"m:rsn:2"]
+    run(cb(Ev(b"m:rsnry:2")))
+    assert r2["serial_start"] == 0
+
+    run(cb(Ev(b"m:rsba:1")))                            # typed answers (prompt -> text)
+    run(nm(Ev(None, text="spam, x")))
+    assert r1["bans"] == ["spam, x"]
+    run(cb(Ev(b"m:rsns:1")))
+    ev = Ev(None, text="abc")
+    run(nm(ev))
+    assert "whole number" in ev.out[0][1] and r1.get("serial_start") is None       # asked again, nothing saved
+    run(nm(Ev(None, text="250")))
+    assert r1["serial_start"] == 250
+
+    ev = Ev(b"m:rs:9")                                  # a stale route number -> popup, no crash
+    run(cb(ev))
+    assert ev.out[0][0] == "answer" and ev.out[0][2]
+
+
+def data_of(ev, n):
+    return [d for row in ev.out[n][2] for _t, d in row]

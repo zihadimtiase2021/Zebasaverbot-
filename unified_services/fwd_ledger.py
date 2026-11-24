@@ -9,7 +9,8 @@ not as a list of single ids: even 100 000 copied messages need only a few bytes.
 
 Layout of the stored JSON::
 
-    {"n": 128, "r": {"-1001>-1002": [[1, 5400], [5402, 5410]]}}      n = last serial number handed out
+    {"n": 128, "r": {"-1001>-1002": [[1, 5400], [5402, 5410]]}, "s": {"-1001>-1003": 41}}
+        n = last serial number handed out · s = (only for routes with their OWN serial counter) last number used there
 """
 from __future__ import annotations
 
@@ -39,6 +40,7 @@ class Ledger:
         self.db = db
         self.ranges: dict[str, list[list[int]]] = {}
         self.serial = 0
+        self.route_serial: dict[str, int] = {}   # route key -> last number of that route's OWN counter
         self.msg_id: int | None = None
         self._dirty = False
         self._lock = asyncio.Lock()
@@ -92,15 +94,38 @@ class Ledger:
             self.serial -= 1
             self.touch()
 
+    def next_route_serial(self, key: str, start: int) -> int:
+        """Next number of a route that has its own counter (it begins at `start`, then counts up)."""
+        n = self.route_serial.get(key, max(int(start), 1) - 1) + 1
+        self.route_serial[key] = n
+        self.touch()
+        return n
+
+    def release_route_serial(self, key: str, n: int) -> None:
+        """The copy with number `n` failed (nothing was posted): hand the number out again."""
+        if self.route_serial.get(key) == n and n > 0:
+            self.route_serial[key] = n - 1
+            self.touch()
+
+    def restart_route_serial(self, key: str) -> None:
+        """The route's start number changed (or it follows the global counter again): count from the new start."""
+        if self.route_serial.pop(key, None) is not None:
+            self.touch()
+
     def forget(self, key: str) -> None:
         if self.ranges.pop(key, None) is not None:
             self.touch()
 
     # ------------------------------------------------------------------ (de)serialise
+    def _data(self) -> dict:
+        data: dict = {"n": self.serial, "r": self.ranges}
+        if self.route_serial:                       # absent for ledgers that never used a per-route counter
+            data["s"] = self.route_serial
+        return data
+
     def dump(self) -> str:
         """Compact JSON. When it would not fit into one message, the smallest gaps are closed (logged)."""
-        data = {"n": self.serial, "r": self.ranges}
-        text = json.dumps(data, separators=(",", ":"), sort_keys=True)
+        text = json.dumps(self._data(), separators=(",", ":"), sort_keys=True)
         closed = 0
         while len(text) > MAX_CHARS:
             best = None  # (gap size, key, index)
@@ -116,7 +141,7 @@ class Ledger:
             rs[i] = [rs[i][0], rs[i + 1][1]]
             del rs[i + 1]
             closed += best[0]
-            text = json.dumps({"n": self.serial, "r": self.ranges}, separators=(",", ":"), sort_keys=True)
+            text = json.dumps(self._data(), separators=(",", ":"), sort_keys=True)
         if closed:
             log.warning("forward ledger too big for one message: closed gaps covering %d id(s)", closed)
         return text
@@ -132,9 +157,15 @@ class Ledger:
             clean: dict[str, list[list[int]]] = {}
             for k, rs in ranges.items():
                 clean[str(k)] = [[int(a), int(b)] for a, b in rs]
+            own = data.get("s", {})
+            if not isinstance(own, dict):
+                return False
+            own_clean = {str(k): int(v) for k, v in own.items()}
         except (ValueError, TypeError, AttributeError):
             return False
         self.serial = max(self.serial, n)
+        for k, v in own_clean.items():
+            self.route_serial[k] = max(self.route_serial.get(k, 0), v)
         for k, rs in clean.items():
             for a, b in rs:
                 self.add(k, a, b)

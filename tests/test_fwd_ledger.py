@@ -83,3 +83,17 @@ def test_saved_messages_persistence():
         await b.close()
 
     asyncio.run(go())
+
+
+def test_route_own_serial_counter_roundtrip_and_old_format():
+    lg = Ledger()
+    assert [lg.next_route_serial("a>b", 7) for _ in range(2)] == [7, 8]      # starts at the route's start number
+    lg.release_route_serial("a>b", 8)                                       # the copy failed: given back
+    assert lg.next_route_serial("a>b", 7) == 8
+    lg.restart_route_serial("a>b")                                          # new start number -> counts from it
+    assert lg.next_route_serial("a>b", 100) == 100
+    other = Ledger()
+    assert other.merge(lg.dump()) and other.route_serial == {"a>b": 100}
+    old = Ledger()                                                          # a ledger saved before this existed
+    assert old.merge('{"n":4,"r":{"1>2":[[1,3]]}}') and old.route_serial == {} and old.serial == 4
+    assert '"s"' not in Ledger().dump()                                     # nothing new is written when unused

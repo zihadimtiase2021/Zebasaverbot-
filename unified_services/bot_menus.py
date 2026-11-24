@@ -189,14 +189,14 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
             job = fw._job_for(r)
             busy = job is not None and job["state"] == "running"
             rows.append([B(f"{'👁' if r['active'] else '⏸'} #{i} {r['src_name'][:11]}➜{r['dst_name'][:11]}",
-                           f"m:fo:{i}".encode()),
+                           f"m:rs:{i}".encode()),
                          B("⏹ Stop" if busy else "📥 All", f"m:{'fx' if busy else 'fl'}:{i}".encode()),
                          B("🗑", f"m:fd:{i}".encode())])
         head = fw._fmt_routes().split("\n\n")[0] if fw.routes else ui.head("🔁", "Forward routes", "No routes yet.")
         many = len(fw_accounts()) > 1
         if many:
             head = f"👤 <b>Account: {html.escape(fw_entry()[1])}</b>\n" + head
-        txt = (head + "\n\n" + ui.hint("Watch ON = new messages are copied automatically (👁/⏸ per route: tap it) · "
+        txt = (head + "\n\n" + ui.hint("Tap a route for its settings (Start/Stop, Watch, ban words, serial numbers) · "
                                        "📥 All = copy the whole source, only what was not copied before · "
                                        "🗑 deletes the route."))
         extra = [[B(f"👁 Watch: {ON(getattr(fw, 'watch', True))}", b"m:fwt")]]
@@ -284,6 +284,81 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
             txt += "\n\n" + ui.hint("Nothing banned yet.")
         return txt, rows[:40] + [[B("➕ Add words / links", b"m:ask:BAN")], ui.nav_row(b"m:fw")]
 
+    # ------------------------------------------------------------------ route settings (one route on its own)
+    def route_at(i: int) -> dict:
+        fw = fwd()
+        if not 1 <= i <= len(fw.routes):
+            raise IndexError("That route no longer exists.")
+        return fw.routes[i - 1]
+
+    def s_route(i: int):
+        fw = fwd()
+        r = route_at(i)
+        job = fw._job_for(r)
+        busy = job is not None and job["state"] == "running"
+        bans = r.get("bans") or []
+        lines = [ui.head("⚙️", f"Route #{i}", f"{html.escape(r['src_name'])} ➜ {html.escape(r['dst_name'])}"), ""]
+        lines.append((f"⏳ <b>Forward</b>: running — {job['sent']} copied · 🔎 {job['scanned']} looked at" if busy else
+                      "⏹ <b>Forward</b>: not running" + (f" (last: {html.escape(job['state'])})" if job else "")))
+        lines.append(f"👁 <b>Watch</b>: {ON(r.get('active', True))}")
+        if not getattr(fw, "watch", True):
+            lines.append(ui.warn("Global Watch is OFF (Forward menu): nothing is copied live until it is ON."))
+        lines.append(f"🚫 <b>Ban words</b>: {len(bans)} here · " + ("only this route's list" if r.get("ban_mode") == "only"
+                                                                  else f"added to the global list ({len(fw.bans)})"))
+        lines.append("🔢 <b>Serial numbers</b>: " + serial_line(r))
+        lines += ["", ui.hint("These settings belong to this route only and are saved.")]
+        rows = [[B("⏹ Stop Forward" if busy else "▶️ Start Forward", f"m:rsg:{i}".encode())],
+                [B(f"👁 Watch: {ON(r.get('active', True))}", f"m:rsw:{i}".encode())],
+                [B(f"🚫 Ban words ({len(bans)})", f"m:rsb:{i}".encode()),
+                 B(f"🔢 Serial: {ON(r.get('serial_on', True))}", f"m:rsn:{i}".encode())]]
+        return "\n".join(lines), rows + [ui.nav_row(b"m:fw")]
+
+    def serial_line(r: dict) -> str:
+        from unified_services.forwarder import new_uid
+        if not r.get("serial_on", True):
+            return "OFF ❌ (copies are posted without an ID)"
+        start = int(r.get("serial_start") or 0)
+        if start <= 0:
+            return "ON ✅ · global counter"
+        last = getattr(fwd().ledger, "route_serial", {}).get(f"{r['src']}>{r['dst']}")
+        return f"ON ✅ · own counter, next <b>{new_uid(serial=(last + 1) if last else start)}</b>"
+
+    def s_route_bans(i: int):
+        fw = fwd()
+        r = route_at(i)
+        bans = r.get("bans") or []
+        only = r.get("ban_mode") == "only"
+        rows = [[B(f"{b[:30]}", b"m:noop"), B("🗑", f"m:rsbu:{i}:{k}".encode())] for k, b in enumerate(bans)]
+        txt = (ui.head("🚫", f"Ban words — route #{i}") + "\n"
+               + ui.hint("Removed from the captions copied by this route. “Combined” adds them to the global list "
+                         f"({len(fw.bans)} word(s)); “Only this route” ignores the global list here."))
+        if not bans:
+            txt += "\n\n" + ui.hint("No ban words for this route yet.")
+        rows = rows[:40] + [[B("➕ Add words / links", f"m:rsba:{i}".encode())]]
+        if bans:
+            rows.append([B("🧹 Clear all", f"m:rsbc:{i}".encode())])
+        rows.append([B("🔒 Only this route's list ✅" if only else "➕ Combined with global ✅", f"m:rsbm:{i}".encode())])
+        return txt, rows + [ui.nav_row(f"m:rs:{i}".encode())]
+
+    def s_route_serial(i: int):
+        r = route_at(i)
+        own = int(r.get("serial_start") or 0) > 0
+        txt = (ui.head("🔢", f"Serial numbers — route #{i}") + "\n" + serial_line(r) + "\n\n"
+               + ui.hint("ON: every copy gets an ID number. A start number gives this route its own counter "
+                         "(other routes keep the global one). OFF: copies are posted without an ID."))
+        rows = [[B(f"🔢 Serial numbers: {ON(r.get('serial_on', True))}", f"m:rsnt:{i}".encode())],
+                [B("✏️ Set start number", f"m:rsns:{i}".encode())]]
+        if own:
+            rows.append([B("↺ Use the global counter", f"m:rsnr:{i}".encode())])
+        return txt, rows + [ui.nav_row(f"m:rs:{i}".encode())]
+
+    def screen_for(back: bytes):
+        """The screen a 'back' key stands for (plain screens, or a route screen like m:rsb:2)."""
+        if back in SCREENS:
+            return SCREENS[back]()
+        kind, _, num = back.decode().rpartition(":")
+        return {"m:rs": s_route, "m:rsb": s_route_bans, "m:rsn": s_route_serial}[kind](int(num))
+
     # ------------------------------------------------------------------ plumbing
     async def put(event, screen, edit: bool = True) -> None:
         text, buttons = await screen if hasattr(screen, "__await__") else screen
@@ -295,9 +370,9 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
         else:
             await event.respond(text, buttons=buttons)
 
-    async def ask(event, kind: str, prompt: str, back: bytes) -> None:
+    async def ask(event, kind: str, prompt: str, back: bytes, extra: dict | None = None) -> None:
         getattr(app, "editing", {}).pop(event.sender_id, None)   # a product edit in progress is dropped
-        pending[event.sender_id] = {"kind": kind, "back": back}
+        pending[event.sender_id] = {"kind": kind, "back": back, **(extra or {})}
         await event.edit(prompt + "\n\n" + ui.hint("Send it as a message now."), buttons=[ui.cancel_row()])
 
     PROMPTS = {
@@ -307,6 +382,10 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
         "TARGET": ui.head("🎯", "Target channel", "Send the channel <code>@username</code>, <code>t.me</code> link "
                                                   "or <code>-100…</code> id."),
         "BAN": ui.head("🚫", "Ban words", "Send words, phrases, links or @names — separate several with a comma or a new line."),
+        "RBAN": ui.head("🚫", "Ban words for this route", "Send words, phrases, links or @names — separate several "
+                                                          "with a comma or a new line."),
+        "RSER": ui.head("🔢", "Start number", "Send the number this route should count from, e.g. <code>1</code> "
+                                              "or <code>250</code>."),
         "BD_START": ui.head("🗑", "Bulk delete") + "\n" + ui.step(1, 2, "send the link of the <b>first</b> (oldest) message "
                     "to delete, e.g. <code>https://t.me/c/2940625991/2236</code>"),
         "FWD_SRC": ui.head("📤", "Add route") + "\n" + ui.step(1, 2, "send the <b>source</b> chat "
@@ -320,7 +399,7 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
         """After a typed value: confirmation + the screen the person came from, as a new message."""
         if note:
             await event.respond(note)
-        await put(event, SCREENS[back](), edit=False)
+        await put(event, screen_for(back), edit=False)
 
     app._wm_screen = s_wm  # used by /wm (plain) in control_bot
     SCREENS = {b"m:wm": s_wm, b"m:set": s_settings, b"m:fw": s_forward, b"m:bn": s_bans}
@@ -353,7 +432,7 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
                 plans.pop(event.sender_id, None)
                 ch = choices.pop(event.sender_id, None) or {}
                 back = pending.pop(event.sender_id, {}).get("back") or ch.get("back", b"m:wm")
-                return await put(event, SCREENS[back]())
+                return await put(event, screen_for(back))
             if a == "pos":
                 return await put(event, s_pos())
             if a == "look":
@@ -463,6 +542,69 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
                 fw = fwd()
                 await event.answer(ui.plain(await fw.set_watch(not getattr(fw, "watch", True))))
                 return await put(event, s_forward())
+            if a == "rs":      # Route Settings
+                return await put(event, s_route(int(p[2])))
+            if a == "rsg":     # start / stop Forward for THIS route only (other routes are not touched)
+                i = int(p[2])
+                fw, r = fwd(), route_at(i)
+                job = fw._job_for(r)
+                if job is not None and job["state"] == "running":
+                    fw.stop_all([r])
+                    await event.answer("⏹ Stopping this route…")
+                else:
+                    await event.answer(ui.plain(fw.start_all([r])))
+                return await put(event, s_route(i))
+            if a == "rsw":     # Watch for this route
+                i = int(p[2])
+                r = route_at(i)
+                await fwd()._cmd_fwd(f"{'unwatch' if r.get('active', True) else 'watch'} {i}")
+                await event.answer(f"👁 Watch {'ON' if r.get('active', True) else 'OFF'} for this route")
+                return await put(event, s_route(i))
+            if a == "rsb":
+                return await put(event, s_route_bans(int(p[2])))
+            if a == "rsba":
+                i = int(p[2])
+                route_at(i)
+                return await ask(event, "RBAN", PROMPTS["RBAN"], f"m:rsb:{i}".encode(), {"route": i})
+            if a == "rsbu":    # remove one ban word
+                i = int(p[2])
+                await event.answer(ui.plain(await fwd().route_ban_remove(route_at(i), int(p[3]))))
+                return await put(event, s_route_bans(i))
+            if a == "rsbm":    # combine with the global list / only this route's list
+                i = int(p[2])
+                r = route_at(i)
+                await event.answer(ui.plain(await fwd().set_ban_mode(r, "add" if r.get("ban_mode") == "only" else "only")))
+                return await put(event, s_route_bans(i))
+            if a == "rsbc":
+                i = int(p[2])
+                n = len(route_at(i).get("bans") or [])
+                return await put(event, (ui.head("🧹", "Clear this route's ban words?", f"{n} word(s) will be removed."),
+                                         [ui.confirm_row("🧹 Yes, clear", f"m:rsbcy:{i}", f"m:rsb:{i}")]))
+            if a == "rsbcy":
+                i = int(p[2])
+                await event.answer(ui.plain(await fwd().route_ban_clear(route_at(i))))
+                return await put(event, s_route_bans(i))
+            if a == "rsn":
+                return await put(event, s_route_serial(int(p[2])))
+            if a == "rsnt":    # serial numbers ON / OFF for this route
+                i = int(p[2])
+                r = route_at(i)
+                await event.answer(ui.plain(await fwd().set_serial_on(r, not r.get("serial_on", True))))
+                return await put(event, s_route_serial(i))
+            if a == "rsns":
+                i = int(p[2])
+                route_at(i)
+                return await ask(event, "RSER", PROMPTS["RSER"], f"m:rsn:{i}".encode(), {"route": i})
+            if a == "rsnr":
+                i = int(p[2])
+                route_at(i)
+                return await put(event, (ui.head("↺", "Use the global counter?", "This route stops counting on its own "
+                                                                                "and continues with the global number."),
+                                         [ui.confirm_row("↺ Yes, reset", f"m:rsnry:{i}", f"m:rsn:{i}")]))
+            if a == "rsnry":
+                i = int(p[2])
+                await event.answer(ui.plain(await fwd().reset_serial(route_at(i))))
+                return await put(event, s_route_serial(i))
             if a == "fm":      # Mixing ON / OFF
                 fw = fwd()
                 await event.answer(ui.plain(await fw.set_mixing(not fw.mixing)), alert=True)
@@ -598,6 +740,12 @@ def register_bot_menus(app, bot, is_admin, accounts=None) -> None:
             if kind == "BAN":
                 ans = await fwd()._cmd_fwd("ban " + event.raw_text)
                 return await home(event, back, ans.split("\n")[0])
+            if kind == "RBAN":
+                return await home(event, back, await fwd().route_ban_add(route_at(st["route"]), event.raw_text))
+            if kind == "RSER":
+                if not val.isdigit():
+                    raise ValueError("send a whole number, e.g. 1 or 250")
+                return await home(event, back, await fwd().set_serial_start(route_at(st["route"]), int(val)))
             if kind == "BD_START":
                 from unified_core.tg import parse_message_link
                 parse_message_link(val)                    # reject a bad link now, not after the second one

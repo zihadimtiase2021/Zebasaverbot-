@@ -32,6 +32,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Callable
 
 from telethon import errors, events, utils
 from telethon.tl.types import MessageMediaWebPage
@@ -63,6 +64,23 @@ class TooLarge(Exception):
 
 
 # ------------------------------------------------------------------ pure helpers
+def route_defaults(r: dict) -> dict:
+    """A saved route with every field present. Routes saved by older versions simply lack the new fields:
+    Watch ON (`active`), no route ban words (`bans`, combined with the global list), serial numbers ON on the
+    global counter (`serial_start` 0)."""
+    bans = r.get("bans")
+    try:
+        start = int(r.get("serial_start") or 0)
+    except (TypeError, ValueError):
+        start = 0
+    return {"src": int(r["src"]), "dst": int(r["dst"]), "src_name": str(r.get("src_name", "")),
+            "dst_name": str(r.get("dst_name", "")), "active": bool(r.get("active", True)),
+            "bans": [str(b) for b in bans if str(b).strip()] if isinstance(bans, list) else [],
+            "ban_mode": "only" if r.get("ban_mode") == "only" else "add",   # add = on top of the global list
+            "serial_on": bool(r.get("serial_on", True)),
+            "serial_start": start if start > 0 else 0}                     # 0 = the global counter
+
+
 def new_uid(prefix: str | None = None, serial: int | None = None) -> str:
     """Serial number: prefix + counter, e.g. ZF-000123 (counter given), else prefix + time + random (legacy form)."""
     prefix = prefix or settings.FWD_ID_PREFIX
@@ -103,6 +121,8 @@ def build_html(raw: str, entities, uid: str, limit: int) -> str:
     except Exception as exc:  # exotic entity: plain text is better than losing the message
         log.debug("html unparse failed (%s) - sending plain text", exc)
         body = _html.escape(cut)
+    if not uid:                              # serial numbers are OFF for this route: the text alone
+        return f"{NOTIFY_MARK}{body}"
     sep = "\n\n" if raw else ""
     return f"{NOTIFY_MARK}{body}{sep}<code>{uid}</code>"
 
@@ -183,8 +203,7 @@ class Forwarder:
             except Exception as exc:
                 log.warning("could not read saved forwarding routes: %s", exc)
         self.routes = [
-            {"src": int(r["src"]), "dst": int(r["dst"]), "src_name": str(r.get("src_name", "")),
-             "dst_name": str(r.get("dst_name", "")), "active": bool(r.get("active", True))}
+            route_defaults(r)
             for r in (data or []) if isinstance(r, dict) and isinstance(r.get("src"), int)
             and isinstance(r.get("dst"), int)
         ]
@@ -351,6 +370,15 @@ class Forwarder:
         for m in msgs:
             self.ledger.add(key, m.id)
 
+    def effective_bans(self, route: dict) -> list[str]:
+        """Ban words for one route: the global list plus the route's own (mode "add"), or only the route's own
+        ("only" = it overrides the global list)."""
+        own = [str(b) for b in route.get("bans") or []]
+        if route.get("ban_mode") == "only":
+            return own
+        have = {b.lower() for b in self.bans}
+        return list(self.bans) + [b for b in own if b.lower() not in have]
+
     async def _copy(self, item: Item) -> str:
         """Copy one message / album to every route of the item. Returns sent | seen | skipped | empty | stopped."""
         if item.job is not None and item.job["stop"]:
@@ -373,19 +401,24 @@ class Forwarder:
         try:
             raw, ents, specs, skipped = await self._prepare(msgs, workdir)
             where = esc(msg_link(item.src, msgs[0].id) or str(item.src))
-            if not specs and not raw:
-                for r in todo:                       # nothing left to send: do not look at it again
-                    self._mark(item.src, r["dst"], msgs)
+            preview = isinstance(msgs[0].media, MessageMediaWebPage) and not self.strip_links
+            delivered = 0
+            for route in todo:
+                # every route cuts its own ban words (global list + the route's list, or only the route's list)
+                r_raw, r_ents = banwords.strip_banned(raw, ents, self.effective_bans(route))
+                if not specs and not r_raw:          # nothing left to send there: do not look at it again
+                    self._mark(item.src, route["dst"], msgs)
+                    continue
+                await self._deliver(route, msgs[0], r_raw, r_ents, specs, preview)
+                self._mark(item.src, route["dst"], msgs)
+                delivered += 1
+                await asyncio.sleep(settings.FWD_DELAY)
+            if not delivered:
                 if skipped:
                     await self.pipeline.notify(
                         f"⚠️ <b>Not copied</b> (file bigger than the upload limit)\n{where}")
                     return "skipped"
                 return "empty"                       # e.g. a message that only held a link
-            preview = isinstance(msgs[0].media, MessageMediaWebPage) and not self.strip_links
-            for route in todo:
-                await self._deliver(route, msgs[0], raw, ents, specs, preview)
-                self._mark(item.src, route["dst"], msgs)
-                await asyncio.sleep(settings.FWD_DELAY)
             if skipped:
                 await self.pipeline.notify(f"⚠️ {skipped} file(s) skipped: bigger than the upload limit ({where})")
             return "sent"
@@ -398,7 +431,7 @@ class Forwarder:
         ents = holder.entities if holder else None
         if self.strip_links:
             raw, ents = banwords.strip_links(raw, ents)   # 1) every link goes
-        raw, ents = banwords.strip_banned(raw, ents, self.bans)  # 2) then the banned words / @names
+        # 2) the banned words / @names are cut per route in _copy (global list + the route's own list)
         specs: list[FileSpec] = []
         skipped = 0
         for m in msgs:
@@ -501,6 +534,59 @@ class Forwarder:
                 job["note"] = "stopped by you"
                 n += 1
         return n
+
+    # ---------------------------------------------------------------- per-route settings (saved with the routes)
+    async def route_ban_add(self, route: dict, text: str) -> str:
+        have = {b.lower() for b in route.setdefault("bans", [])}
+        added = [b for b in banwords.split_bans(text) if b.lower() not in have]
+        if not added:
+            raise ValueError("send at least one new word, link or @name (comma or new line separated)")
+        route["bans"] += added
+        await self._persist()
+        return f"✅ Route ban list: +{len(added)} ({len(route['bans'])} total)"
+
+    async def route_ban_remove(self, route: dict, index: int) -> str:
+        bans = route.setdefault("bans", [])
+        if not 0 <= index < len(bans):
+            raise ValueError("no such ban word")
+        gone = bans.pop(index)
+        await self._persist()
+        return f"✅ Removed: {gone}"
+
+    async def route_ban_clear(self, route: dict) -> str:
+        n = len(route.get("bans") or [])
+        route["bans"] = []
+        await self._persist()
+        return f"✅ Route ban list cleared ({n})"
+
+    async def set_ban_mode(self, route: dict, mode: str) -> str:
+        route["ban_mode"] = "only" if mode == "only" else "add"
+        await self._persist()
+        if route["ban_mode"] == "only":
+            return "🔒 Only this route's ban words are used (the global list is ignored here)."
+        return "➕ This route's ban words are added to the global list."
+
+    async def set_serial_on(self, route: dict, on: bool) -> str:
+        route["serial_on"] = bool(on)
+        await self._persist()
+        return ("🔢 Serial numbers <b>ON</b> for this route." if on else
+                "🔢 Serial numbers <b>OFF</b> for this route: copies are posted without an ID number.")
+
+    async def set_serial_start(self, route: dict, start: int) -> str:
+        """The route gets its own counter beginning at `start`."""
+        if int(start) < 1:
+            raise ValueError("the start number must be 1 or higher")
+        route["serial_start"] = int(start)
+        self.ledger.restart_route_serial(route_key(route["src"], route["dst"]))
+        await self._persist()
+        return f"🔢 This route now counts from <b>{new_uid(serial=int(start))}</b>."
+
+    async def reset_serial(self, route: dict) -> str:
+        """Back to the global counter (the route's own counter is dropped)."""
+        route["serial_start"] = 0
+        self.ledger.restart_route_serial(route_key(route["src"], route["dst"]))
+        await self._persist()
+        return "🔢 This route uses the global counter again."
 
     async def reset_progress(self, routes: list[dict]) -> str:
         """Start fresh for `routes`: forget what was copied (ledger), drop the saved / finished Forward all job
@@ -790,24 +876,47 @@ class Forwarder:
         return "\n\n".join(self._fmt_job(j) for j in self.jobs.values())
 
     # ---------------------------------------------------------------- upload
-    async def _uid_for(self, route: dict, src_msg) -> tuple[str, int]:
-        """Next serial number (ZF-000123). The database row doubles as a lock against a duplicate serial."""
+    async def _uid_for(self, route: dict, src_msg) -> tuple[str, str, Callable[[], None]]:
+        """(database id, id shown in the post, function that gives the number back when the copy fails).
+        Default: the next number of the global counter (ZF-000123); the database row doubles as a lock against a
+        duplicate. A route can have its own counter (`serial_start`) - then the same number may exist in two routes,
+        so the database id gets a short suffix when it is taken. With serial numbers OFF nothing is shown, a hidden
+        id is still kept for /find."""
+        key = route_key(route["src"], route["dst"])
+        if not route.get("serial_on", True):
+            for _ in range(100):
+                uid = new_uid()                      # hidden: prefix + time + random, uses no number
+                if await db.fwd_reserve(uid, route["src"], src_msg.id, route["dst"]):
+                    return uid, "", lambda: None
+            raise RuntimeError("could not allocate an id")
+        start = int(route.get("serial_start") or 0)
         for _ in range(100):
-            n = self.ledger.next_serial()
-            uid = new_uid(serial=n)
-            if await db.fwd_reserve(uid, route["src"], src_msg.id, route["dst"]):
-                return uid, n
+            if start > 0:
+                n = self.ledger.next_route_serial(key, start)
+
+                def give_back(n=n):
+                    self.ledger.release_route_serial(key, n)
+            else:
+                n = self.ledger.next_serial()
+
+                def give_back(n=n):
+                    self.ledger.release(n)
+            shown = new_uid(serial=n)
+            tries = (shown, f"{shown}~{secrets.token_hex(2).upper()}") if start > 0 else (shown,)
+            for uid in tries:
+                if await db.fwd_reserve(uid, route["src"], src_msg.id, route["dst"]):
+                    return uid, shown, give_back
         raise RuntimeError("could not allocate a serial number")
 
     async def _deliver(self, route: dict, first_msg, raw, ents, specs, preview: bool) -> None:
         dst = route["dst"]
-        uid, serial = await self._uid_for(route, first_msg)
+        uid, shown, give_back = await self._uid_for(route, first_msg)
         self._busy[dst] = self._busy.get(dst, 0) + 1
         try:
-            sent = await self._send(dst, uid, raw, ents, specs, preview)
+            sent = await self._send(dst, shown, raw, ents, specs, preview)
         except BaseException:
             await db.fwd_drop(uid)
-            self.ledger.release(serial)              # nothing was posted: the number is handed out again
+            give_back()                              # nothing was posted: the number is handed out again
             raise
         finally:
             self._busy[dst] -= 1
@@ -821,7 +930,7 @@ class Forwarder:
             await db.fwd_set_details(uid, route.get("src_name", ""), raw or "", len(specs), self.me_id, default)
         except Exception as exc:
             log.debug("could not save the details of %s: %s", uid, exc)
-        log.info("copied %s:%s -> %s as %s", route["src"], first_msg.id, dst, uid)
+        log.info("copied %s:%s -> %s as %s", route["src"], first_msg.id, dst, shown or uid)
 
     async def _send(self, dst, uid: str, raw, ents, specs: list[FileSpec], preview: bool) -> list:
         retry = self.pipeline._retry
@@ -831,6 +940,8 @@ class Forwarder:
                 dst, text, parse_mode="html", link_preview=preview))]
         if len(specs) == 1 and specs[0].kind in NO_CAPTION:  # sticker / round video: id goes in a reply
             media = await retry(lambda: self._send_one(dst, specs[0], None))
+            if not uid and not raw:                  # serial numbers OFF and no text: nothing to say in a reply
+                return [media]
             text = build_html(raw, ents, uid, TEXT_LIMIT)
             note = await retry(lambda: self.userbot.send_message(
                 dst, text, parse_mode="html", reply_to=media.id, link_preview=False))
@@ -975,8 +1086,8 @@ class Forwarder:
     async def _add_route(self, src_id: int, src_name: str, dst_ent) -> str:
         dst_id = await self._check_route(src_id, dst_ent)
         dst_name = self._name(dst_ent)
-        self.routes.append({"src": src_id, "dst": dst_id, "src_name": src_name, "dst_name": dst_name,
-                            "active": True})
+        self.routes.append(route_defaults({"src": src_id, "dst": dst_id, "src_name": src_name,
+                                           "dst_name": dst_name, "active": True}))
         await self._persist()
         return (f"✅ <b>Route #{len(self.routes)}</b>: {esc(src_name)} ➜ {esc(dst_name)}\n"
                 "👁 Every new message there is now copied (download + upload) with a serial number.\n"
